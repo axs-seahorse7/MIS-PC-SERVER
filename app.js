@@ -12,7 +12,21 @@ import { globalErrorHandler } from "./utils/AppError.js";
 // Route imports
 import userRoutes from "./routes/user.routes.js";
 import authRoutes from "./routes/auth.routes.js";
-
+import categoryRoutes from "./routes/categories.routes.js";
+import productRoutes from "./routes/product.routes.js";
+import stageRoutes from "./routes/stages.routes.js";
+import stageScanFieldRoutes from "./routes/stageScanField.routes.js";
+import productStagesFlowRoutes from "./routes/productStagesFlow.routes.js";
+import productionFieldRoutes from "./routes/prodcutionField.routes.js";
+import itemsRoutes from "./routes/items.routes.js";
+import itemFieldValuesRoutes from "./routes/itemFieldValues.routes.js";
+import scanHistoryRoutes from "./routes/scanHistory.routes.js";
+import fctRoutes from "./routes/fct.routes.js";
+import externalSourceRoutes from "./routes/externalSource.routes.js";
+import externalResultRoutes from "./routes/externalResult.routes.js";
+import externalSourceMappingRoutes from "./routes/externalSourceMapping.routes.js";
+import productionLineRoutes from "./routes/productionLine.controller.js";
+import factoryRoutes from "./routes/factory.routes.js";
 
 const app = express();
 
@@ -20,7 +34,7 @@ const app = express();
 connectDB();
 
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} ORIGIN: ${req.headers.origin}`);
+  console.log(`[${new Date().getHours()}:${new Date().getMinutes()}:${new Date().getSeconds()}] : [${req.method}] > ${req.url} [ORIGIN] >  ${req.headers.origin}`);
   next();
 });
 
@@ -51,6 +65,23 @@ app.get("/health", (req, res) => {
 // ---------- Routes ----------
 app.use("/api/users", userRoutes);
 app.use("/api/auth", authRoutes);
+app.use("/api/categories", categoryRoutes);
+app.use("/api/products", productRoutes);
+app.use("/api/stages", stageRoutes);
+app.use("/api/stage-scan-fields", stageScanFieldRoutes);
+app.use("/api/product-stage-flow", productStagesFlowRoutes);
+app.use("/api/product-fields", productionFieldRoutes);
+app.use("/api/items", itemsRoutes);
+app.use("/api/item-field-values", itemFieldValuesRoutes);
+app.use("/api/scan-history", scanHistoryRoutes);
+app.use("/api/fct", fctRoutes);
+app.use("/api/external-sources", externalSourceRoutes);
+app.use("/api/external-results", externalResultRoutes);
+app.use("/api/external-source-mappings", externalSourceMappingRoutes);
+app.use("/api/production-lines", productionLineRoutes);
+app.use("/api/factories", factoryRoutes);
+
+
 
 
 // ---------- 404 ----------
