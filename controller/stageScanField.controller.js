@@ -105,6 +105,9 @@ export const updateStageScanField = async (req, res) => {
     const { id } = req.params;
     const { product_field_id, is_required } = req.body;
 
+    console.log("Updating stage scan field with ID:", id);
+    console.log("New product_field_id:", product_field_id);
+
     const [result] = await pool.query(
       `UPDATE stage_scan_fields SET product_field_id = ?, is_required = ? WHERE id = ?`,
       [product_field_id, is_required, id]

@@ -44,10 +44,7 @@ export const loginUser = async (req, res) => {
 
     const user = rows[0];
 
-    const isPasswordValid = await bcrypt.compare(
-      password,
-      user.password
-    );
+    const isPasswordValid = await bcrypt.compare(password, user.password);
 
     if (!isPasswordValid) {
       return res.status(401).json({
@@ -75,17 +72,59 @@ export const loginUser = async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
+    // fetch factory/line/stage same as getMe
+    const [detailRows] = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.name,
+        u.email,
+        u.role,
+        u.stage_id,
+
+        f.id   AS factory_id,
+        f.name AS factory_name,
+
+        l.id   AS line_id,
+        l.name AS line_name,
+
+        s.id   AS stage_id_full,
+        s.name AS stage_name
+
+      FROM users u
+      LEFT JOIN factories f ON u.factory_id = f.id
+      LEFT JOIN production_lines l ON u.line_id = l.id
+      LEFT JOIN stages s ON u.stage_id = s.id
+      WHERE u.id = ?
+      `,
+      [user.id]
+    );
+
+    const row = detailRows[0];
+
     return res.status(200).json({
       token,
       success: true,
       message: "Login successful",
       user: {
-        id: user.id,
-        username: user.username,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        stage_id: user.stage_id,
+        id: row.id,
+        username: row.username,
+        name: row.name,
+        email: row.email,
+        role: row.role,
+
+        factory: row.factory_id
+          ? { id: row.factory_id, name: row.factory_name }
+          : null,
+
+        line: row.line_id
+          ? { id: row.line_id, name: row.line_name }
+          : null,
+
+        stage: row.stage_id_full
+          ? { id: row.stage_id_full, name: row.stage_name }
+          : null,
       },
     });
   } catch (err) {
@@ -101,21 +140,100 @@ export const loginUser = async (req, res) => {
 export const getMe = async (req, res) => {
   try {
     const user = req.user;
+
     if (!user) {
-      return res.status(401).json({ success: false, message: "Not authenticated" });
+      return res.status(401).json({
+        success: false,
+        message: "Not authenticated",
+      });
     }
 
-    const [rows] = await pool.query("SELECT * FROM users WHERE id = ?", [user.id]);
+    const [rows] = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.username,
+      u.name,
+      u.email,
+      u.role,
+      u.is_active,
+      u.created_at,
+
+      f.id   AS factory_id,
+      f.name AS factory_name,
+
+      l.id   AS line_id,
+      l.name AS line_name,
+
+      s.id   AS stage_id,
+      s.name AS stage_name
+
+    FROM users u
+
+    LEFT JOIN factories f
+      ON u.factory_id = f.id
+
+    LEFT JOIN production_lines l
+      ON u.line_id = l.id
+
+    LEFT JOIN stages s
+      ON u.stage_id = s.id
+
+    WHERE u.id = ?
+    `,
+    [user.id]
+  );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const row = rows[0];
 
     return res.status(200).json({
       success: true,
-      user: rows[0],
+      user: {
+        id: row.id,
+        username: row.username,
+        name: row.name,
+        email: row.email,
+        role: row.role,
+        is_active: row.is_active,
+        created_at: row.created_at,
+
+        factory: row.factory_id
+          ? {
+              id: row.factory_id,
+              name: row.factory_name,
+            }
+          : null,
+
+        line: row.line_id
+          ? {
+              id: row.line_id,
+              name: row.line_name,
+            }
+          : null,
+
+        stage: row.stage_id
+          ? {
+              id: row.stage_id,
+              name: row.stage_name,
+            }
+          : null,
+      },
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ success: false, message: "Something went wrong" });
-  }
 
+    return res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
 };
 
 export const logout = (req, res) => {

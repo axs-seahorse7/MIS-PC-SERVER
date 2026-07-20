@@ -6,16 +6,16 @@ export const createProductStageFlow = async (req, res) => {
       product_id,
       stage_id,
       sequence_no,
-      scan_model,
+      scan_mode,
       group_required,
       is_mandatory = 1,
     } = req.body;
 
     const [result] = await pool.query(
       `INSERT INTO product_stage_flow
-      (product_id, stage_id, sequence_no, scan_model, group_required, is_mandatory)
+      (product_id, stage_id, sequence_no, scan_mode, group_required, is_mandatory)
       VALUES (?, ?, ?, ?, ?, ?)`,
-      [product_id, stage_id, sequence_no, scan_model, group_required, is_mandatory]
+      [product_id, stage_id, sequence_no, scan_mode, group_required, is_mandatory]
     );
 
     return res.status(201).json({
@@ -166,5 +166,4 @@ export const deleteProductStageFlow = async (req, res) => {
     });
   }
 };
-
 

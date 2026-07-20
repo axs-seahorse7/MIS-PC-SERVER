@@ -1,14 +1,9 @@
 import express from "express";
-import { createScanHistory, getScanHistory, getItemScanHistory, getStageScanHistory } from "../controller/stageHistory.controller.js";
+import { createScanHistory, submitScan} from "../controller/scanHistory.controller.js";
 
 const router = express.Router();
 
-router.post("/create", createScanHistory);
+router.post("/create", submitScan);
 
-router.get("/all", getScanHistory);
-
-router.get("/item/:itemId",getItemScanHistory);
-
-router.get("/stage/:stageId",getStageScanHistory);
 
 export default router;

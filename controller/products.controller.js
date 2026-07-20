@@ -1,90 +1,94 @@
-import {pool} from "../DB/config/mysql.config.js"
-
+import { pool } from "../DB/config/mysql.config.js";
 
 export const createProducts = async (req, res) => {
-    try {
-        const { categoryId, name, description, remarks } = req.body;
+  try {
+    const { categoryId, name, description, remarks, erpNo, serialNo } = req.body;
 
-        const [result] = await pool.query(
-            `INSERT INTO products (category_id, name, description, remarks)
-             VALUES (?, ?, ?, ?)`,
-            [categoryId, name, description, remarks]
-        );
+    const [result] = await pool.query(
+      `INSERT INTO products (category_id, name, description, remarks, erp_no, serial_no)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [categoryId, name, description, remarks, erpNo, serialNo]
+    );
 
-        return res.status(201).json({
-            message: "Product created successfully",
-            id: result.insertId
-        });
-    } catch (error) {
-        console.log("ERR IN CREATE PRODUCT:", error);
-        return res.status(500).json({
-            message: error.message
-        });
-    }
+    return res.status(201).json({
+      message: "Product created successfully",
+      id: result.insertId,
+    });
+  } catch (error) {
+    console.log("ERR IN CREATE PRODUCT:", error);
+    return res.status(500).json({ message: error.message });
+  }
 };
 
 export const updateProduct = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { categoryId, name, description, remarks } = req.body;
+  try {
+    const { id } = req.params;
+    const { categoryId, name, description, remarks, erpNo, serialNo } = req.body;
 
-        const [result] = await pool.query(
-            `UPDATE products SET category_id = ?, name = ?, description = ?, remarks = ? WHERE id = ?`,
-            [categoryId, name, description, remarks, id]
-        );
+    const [result] = await pool.query(
+      `UPDATE products
+       SET category_id = ?, name = ?, description = ?, remarks = ?, erp_no = ?, serial_no = ?
+       WHERE id = ?`,
+      [categoryId, name, description, remarks, erpNo, serialNo, id]
+    );
 
-        if (result.affectedRows === 0) {
-            return res.status(404).json({
-                message: "Product not found"
-            });
-        }
-
-        return res.status(200).json({
-            message: "Product updated successfully"
-        });
-    } catch (error) {
-        console.log("ERR IN UPDATE PRODUCT:", error);
-        return res.status(500).json({
-            message: error.message
-        });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Product not found" });
     }
+
+    return res.status(200).json({ message: "Product updated successfully" });
+  } catch (error) {
+    console.log("ERR IN UPDATE PRODUCT:", error);
+    return res.status(500).json({ message: error.message });
+  }
 };
 
 export const deleteProduct = async (req, res) => {
-    try {
-        const { id } = req.params;
+  try {
+    const { id } = req.params;
 
-        const [result] = await pool.query(
-            `DELETE FROM products WHERE id = ?`,
-            [id]
-        );
+    const [result] = await pool.query(`DELETE FROM products WHERE id = ?`, [id]);
 
-        if (result.affectedRows === 0) {
-            return res.status(404).json({
-                message: "Product not found"
-            });
-        }
-
-        return res.status(200).json({
-            message: "Product deleted successfully"
-        });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Product not found" });
     }
-    catch (error) {
-        console.log("ERR IN DELETE PRODUCT:", error);
-        return res.status(500).json({
-            message: error.message
-        });
-    }
+
+    return res.status(200).json({ message: "Product deleted successfully" });
+  } catch (error) {
+    console.log("ERR IN DELETE PRODUCT:", error);
+    return res.status(500).json({ message: error.message });
+  }
 };
 
-
 export const getProducts = async (req, res) => {
-    try {
-        const [result] = await pool.query(`SELECT * FROM products`);
+  try {
+    const [result] = await pool.query(`SELECT * FROM products`);
+    return res.status(200).json(result);
+  } catch (error) {
+    console.log("ERR IN GET PRODUCTS:", error);
+    return res.status(500).json({ message: error.message });
+  }
+};
 
-        return res.status(200).json(result);
-    } catch (error) {
-        console.log("ERR IN GET PRODUCTS:", error);
-        return res.status(500).json({ message: error.message });
+export const getProductsByCategory = async (req, res) => {
+  try {
+    const { categoryId } = req.params;
+
+    if (!categoryId) {
+      return res.status(400).json({ success: false, message: "categoryId is required" });
     }
+
+    const [rows] = await pool.query(
+      `SELECT id, category_id, name, description, erp_no, serial_no
+       FROM products
+       WHERE category_id = ? AND is_active = 1
+       ORDER BY name ASC`,
+      [categoryId]
+    );
+
+    return res.status(200).json({ success: true, data: rows });
+  } catch (error) {
+    console.log("ERR IN GET PRODUCTS BY CATEGORY:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
 };
