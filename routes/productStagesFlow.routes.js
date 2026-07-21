@@ -5,7 +5,7 @@ const router = express.Router();
 
 router.post("/create", createProductStageFlow);
 router.get("/all", getProductStageFlows);
-router.get("/product/:productId", getProductFlowByProductId);
+router.get("/:productId", getProductFlowByProductId);
 router.put("/update/:id", updateProductStageFlow);
 router.delete("/delete/:id", deleteProductStageFlow);
 

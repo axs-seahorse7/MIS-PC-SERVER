@@ -1,255 +1,256 @@
 import { pool } from "../DB/config/mysql.config.js";
 
-const createScanHistory = async (req, res) => {
-  const conn = await pool.getConnection();
-  try {
-    const { scanned_value } = req.body;
-    const userId = req.user.id; // never trust frontend for identity
 
-    if (!scanned_value) {
-      return res.status(400).json({ success: false, message: "scanned_value is required" });
-    }
 
-    // 1. Get factory_id, line_id, stage_id from the logged-in user (DB, not JWT/body)
-    const [userRows] = await conn.query(
-      `SELECT id, factory_id, line_id, stage_id FROM users WHERE id = ?`,
-      [userId]
-    );
+// ---- shared sequence/duplicate validation, extracted from your original code ----
+const validateScanSequence = async (conn, { scanned_value, stage_id, product_id, currentSeq }) => {
+  const [lastScanRows] = await conn.query(
+    `SELECT MAX(sequence_no) AS lastSeq FROM scan_history WHERE scanned_value = ? AND status = 'SUCCESS'`,
+    [scanned_value]
+  );
+  const lastSeq = lastScanRows[0].lastSeq || 0;
 
-    if (!userRows.length) {
-      return res.status(401).json({ success: false, message: "User not found" });
-    }
-
-    const { factory_id, line_id, stage_id } = userRows[0];
-
-    if (!stage_id) {
-      return res.status(400).json({ success: false, message: "User is not assigned to a stage" });
-    }
-
-    // 2. Resolve item from scanned_value
-    const [itemRows] = await conn.query(
-      `SELECT id, product_id FROM items WHERE qr_value = ?`,
-      [scanned_value]
-    );
-
-    if (!itemRows.length) {
-      return res.status(404).json({ success: false, message: "Invalid or unrecognized scan value" });
-    }
-
-    const item = itemRows[0];
-
-    // 3. Get the product's stage sequence
-    const [flowRows] = await conn.query(
-      `SELECT stage_id, sequence_order
-       FROM product_stage_flow
-       WHERE product_id = ?
-       ORDER BY sequence_order ASC`,
-      [item.product_id]
-    );
-
-    if (!flowRows.length) {
-      return res.status(400).json({ success: false, message: "No stage flow configured for this product" });
-    }
-
-    const currentFlowEntry = flowRows.find((f) => f.stage_id === stage_id);
-
-    if (!currentFlowEntry) {
-      return res.status(400).json({
-        success: false,
-        message: "Your stage is not part of this product's flow",
-      });
-    }
-
-    const expectedSequence = currentFlowEntry.sequence_order;
-
-    // 4. Find last successful scan for this item
-    const [lastScanRows] = await conn.query(
-      `SELECT sh.stage_id, psf.sequence_order
-       FROM scan_history sh
-       JOIN product_stage_flow psf
-         ON psf.stage_id = sh.stage_id AND psf.product_id = ?
-       WHERE sh.item_id = ? AND sh.status = 'SUCCESS'
-       ORDER BY sh.scanned_at DESC
-       LIMIT 1`,
-      [item.product_id, item.id]
-    );
-
-    const lastSequence = lastScanRows.length ? lastScanRows[0].sequence_order : 0;
-
-    let status = "SUCCESS";
-    let remarks = null;
-
-    // 5. Validate sequence
-    if (expectedSequence === lastSequence) {
-      // same stage scanned again
-      status = "REJECTED";
-      remarks = `Duplicate scan. Stage already recorded for this item.`;
-    } else if (expectedSequence < lastSequence) {
-      status = "REJECTED";
-      remarks = `Backward scan not allowed. Item already past this stage.`;
-    } else if (expectedSequence > lastSequence + 1) {
-      const missingStage = flowRows.find((f) => f.sequence_order === lastSequence + 1);
-      status = "REJECTED";
-      remarks = `Stage ${lastSequence + 1} must be completed before stage ${expectedSequence}.`;
-    }
-
-    // 6. Insert scan_history record (success or rejected, both logged)
-    const [result] = await conn.query(
-      `INSERT INTO scan_history
-        (item_id, factory_id, line_id, stage_id, user_id, scanned_value, status, remarks)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [item.id, factory_id, line_id, stage_id, userId, scanned_value, status, remarks]
-    );
-
-    return res.status(status === "SUCCESS" ? 201 : 400).json({
-      success: status === "SUCCESS",
-      message: status === "SUCCESS" ? "Scan recorded successfully" : remarks,
-      id: result.insertId,
-      status,
-    });
-  } catch (error) {
-    console.log("ERR IN CREATE SCAN HISTORY:", error);
-    return res.status(500).json({ success: false, message: error.message });
-  } finally {
-    conn.release();
+  const [duplicate] = await conn.query(
+    `SELECT id FROM scan_history WHERE scanned_value = ? AND stage_id = ? AND status = 'SUCCESS' LIMIT 1`,
+    [scanned_value, stage_id]
+  );
+  if (duplicate.length) {
+    return { ok: false, message: `"${scanned_value}" is already scanned at this stage.` };
   }
+
+  if (currentSeq === lastSeq) {
+    return { ok: false, message: `"${scanned_value}": this stage is already completed for this item.` };
+  }
+  if (currentSeq < lastSeq) {
+    return { ok: false, message: `"${scanned_value}": backward scan not allowed, item already progressed past this stage.` };
+  }
+  if (currentSeq > lastSeq + 1) {
+    const [missingFlow] = await conn.query(
+      `SELECT psf.sequence_no, s.name AS stage_name
+       FROM product_stage_flow psf
+       JOIN stages s ON s.id = psf.stage_id
+       WHERE psf.product_id = ? AND psf.sequence_no BETWEEN ? AND ?
+       ORDER BY psf.sequence_no ASC`,
+      [product_id, lastSeq + 1, currentSeq - 1]
+    );
+    const missingNames = missingFlow.map((f) => f.stage_name).join(", ");
+    return {
+      ok: false,
+      message: `"${scanned_value}": missing stage(s) ${missingNames || `sequence ${lastSeq + 1}`} must be scanned first.`,
+    };
+  }
+
+  return { ok: true };
 };
 
+// ---- SINGLE ----
+const handleSingleScan = async (conn, res, ctx) => {
+  const { factory_id, line_id, stage_id, userId, scanned_value, currentSeq } = ctx;
+  const [result] = await conn.query(
+    `INSERT INTO scan_history (factory_id, line_id, stage_id, user_id, scanned_value, sequence_no, status, group_id)
+     VALUES (?,?,?,?,?,?,'SUCCESS',NULL)`,
+    [factory_id, line_id, stage_id, userId, scanned_value, currentSeq]
+  );
+  return res.status(201).json({
+    success: true,
+    message: "Scan recorded successfully.",
+    data: { id: result.insertId, sequence_no: currentSeq, scan_mode: "SINGLE", pending_group: false },
+  });
+};
 
+// ---- GROUP_CREATE ----
+// Item is inserted immediately (SUCCESS, group_id NULL) so sequence/duplicate
+// checks keep working for the *next* item scanned. It stays "pending" until
+// the frontend calls POST /scan/create-group with the ids to finalize.
+const handleGroupCreate = async (conn, res, ctx) => {
+  const { factory_id, line_id, stage_id, userId, scanned_value, currentSeq } = ctx;
+  const [result] = await conn.query(
+    `INSERT INTO scan_history (factory_id, line_id, stage_id, user_id, scanned_value, sequence_no, status, group_id)
+     VALUES (?,?,?,?,?,?,'SUCCESS',NULL)`,
+    [factory_id, line_id, stage_id, userId, scanned_value, currentSeq]
+  );
+
+  const [pending] = await conn.query(
+    `SELECT id, scanned_value FROM scan_history
+     WHERE stage_id = ? AND user_id = ? AND group_id IS NULL AND status = 'SUCCESS'
+     ORDER BY scanned_at ASC`,
+    [stage_id, userId]
+  );
+
+  return res.status(201).json({
+    success: true,
+    message: "Scan recorded, pending group save.",
+    data: {
+      id: result.insertId,
+      sequence_no: currentSeq,
+      scan_mode: "GROUP_CREATE",
+      pending_group: true,
+      pending_items: pending, // frontend renders this list + a "Save Group" button
+    },
+  });
+};
+
+// ---- GROUP_SCAN ----
+// scanned_value here is assumed to be the GROUP CODE (not an item code).
+// Every member item of the group is validated + advanced to this stage together.
+const handleGroupScan = async (conn, res, ctx) => {
+  const { factory_id, line_id, stage_id, userId, scanned_value: code, product_id, currentSeq } = ctx;
+
+  // Find this item's most recent SUCCESSFUL scan — i.e. the last stage it
+  // actually completed. Ordering by sequence_no (then scanned_at as a
+  // tiebreaker) is required here; without it MySQL can return ANY matching
+  // row for this scanned_value, since the item has one row per stage.
+  const [lastRows] = await conn.query(
+    `SELECT group_id, sequence_no
+     FROM scan_history
+     WHERE scanned_value = ? AND status = 'SUCCESS'
+     ORDER BY sequence_no DESC, scanned_at DESC
+     LIMIT 1`,
+    [code]
+  );
+
+  if (!lastRows.length) {
+    return res.status(400).json({
+      success: false,
+      message: "This item not Grouped yet. Please create a group first before scanning.",
+    });
+  }
+
+  const { group_id: groupId, sequence_no: lastSeq } = lastRows[0];
+
+  if (!groupId) {
+    return res.status(400).json({
+      success: false,
+      message: "This item isn't part of a group yet — create the group first.",
+    });
+  }
+
+  // The item's last completed stage must be EXACTLY one behind this stage.
+  if (lastSeq !== currentSeq - 1) {
+    return res.status(400).json({
+      success: false,
+      message:
+        lastSeq >= currentSeq
+          ? "This Item is already scanned at this stage or beyond."
+          : "Previous stage not completed for this item.",
+    });
+  }
+
+  const [groupRows] = await conn.query(
+    `SELECT id, product_id FROM scan_groups WHERE id = ?`,
+    [groupId]
+  );
+
+  if (!groupRows.length) {
+    return res.status(400).json({ success: false, message: "Group record not found." });
+  }
+
+  if (groupRows[0].product_id !== product_id) {
+    return res.status(400).json({ success: false, message: "Group does not belong to this product." });
+  }
+
+  const [members] = await conn.query(
+    `SELECT DISTINCT scanned_value FROM scan_history WHERE group_id = ?`,
+    [groupId]
+  );
+  if (!members.length) {
+    return res.status(400).json({ success: false, message: "Group has no member items." });
+  }
+
+  // Validate every member individually too — catches any member that
+  // somehow fell out of sync with the rest of the group (e.g. a manual
+  // DB edit, or a partial failure in an earlier stage).
+  for (const m of members) {
+    const check = await validateScanSequence(conn, {
+      scanned_value: m.scanned_value,
+      stage_id,
+      product_id,
+      currentSeq,
+    });
+    if (!check.ok) {
+      return res.status(400).json({ success: false, message: `Item ${m.scanned_value}: ${check.message}` });
+    }
+  }
+
+  const insertedIds = [];
+  for (const m of members) {
+    const [result] = await conn.query(
+      `INSERT INTO scan_history (factory_id, line_id, stage_id, user_id, scanned_value, sequence_no, status, group_id)
+       VALUES (?,?,?,?,?,?,'SUCCESS',?)`,
+      [factory_id, line_id, stage_id, userId, m.scanned_value, currentSeq, groupId]
+    );
+    insertedIds.push(result.insertId);
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: "Group scan recorded successfully.",
+    data: { group_id: groupId, sequence_no: currentSeq, scan_mode: "GROUP_SCAN", items_advanced: insertedIds.length },
+  });
+};
+
+// ---- dispatcher ----
 export const submitScan = async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const { scanned_value, product_id } = req.body;
-    const userId = req.user.id; 
+    const userId = req?.user?.id;
 
     if (!scanned_value) {
-      return res.status(400).json({ success: false, message: "scanned_value is required" });
+      return res.status(400).json({ success: false, message: "Scanned code is required" });
     }
     if (!product_id) {
       return res.status(400).json({ success: false, message: "product_id is required" });
     }
 
-    // 1. Never trust factory/line/stage from frontend — fetch fresh from DB via user id
     const [userRows] = await conn.query(
       `SELECT id, factory_id, line_id, stage_id FROM users WHERE id = ?`,
       [userId]
     );
-
     if (!userRows.length) {
       return res.status(401).json({ success: false, message: "User not found" });
     }
-
     const { factory_id, line_id, stage_id } = userRows[0];
-
     if (!stage_id) {
       return res.status(400).json({ success: false, message: "User is not assigned to a stage" });
     }
 
-    // 2. Resolve item from scanned_value
-    const [itemRows] = await conn.query(
-      `SELECT id, product_id FROM items WHERE qr_value = ?`,
-      [scanned_value]
-    );
-
-    if (!itemRows.length) {
-      return res.status(404).json({ success: false, message: "Invalid or unrecognized scan value" });
-    }
-
-    const item = itemRows[0];
-
-    if (item.product_id !== Number(product_id)) {
-      return res.status(400).json({
-        success: false,
-        message: "Scanned item does not belong to the selected product",
-      });
-    }
-
-    // 3. Get this stage's position + rules in the product's flow
+    // is_mandatory / group_required are gone. is_external_dependency and
+    // external_source are pulled through too, in case downstream logic
+    // needs to flag/display an external dependency later.
     const [flowRows] = await conn.query(
-      `SELECT id, sequence_no, is_mandatory, scan_mode, group_required
+      `SELECT id, sequence_no, scan_mode, is_external_dependency, external_source
        FROM product_stage_flow
        WHERE product_id = ? AND stage_id = ?`,
-      [item.product_id, stage_id]
+      [product_id, stage_id]
     );
 
     if (!flowRows.length) {
-      return res.status(400).json({
-        success: false,
-        message: "This stage is not part of the product's flow",
-      });
+      return res.status(400).json({ success: false, message: "This stage is not part of the product's flow" });
     }
 
-    const { sequence_no: currentSeq, scan_mode, group_required } = flowRows[0];
+    const { sequence_no: currentSeq, scan_mode, is_external_dependency, external_source } = flowRows[0];
 
-    // 4. Last successful sequence for this item — no join needed, sequence_no is denormalized
-    const [lastScanRows] = await conn.query(
-      `SELECT MAX(sequence_no) AS lastSeq
-       FROM scan_history
-       WHERE item_id = ? AND status = 'SUCCESS'`,
-      [item.id]
-    );
+    const ctx = { factory_id, line_id, stage_id, userId, scanned_value, product_id, currentSeq };
 
-    const lastSeq = lastScanRows[0].lastSeq || 0;
 
-    // 5. Validate sequence
-    if (currentSeq === lastSeq) {
-      return res.status(400).json({
-        success: false,
-        message: "Duplicate scan: this stage is already completed for this item.",
-      });
+    if (scan_mode !== "GROUP_SCAN") {
+      const validation = await validateScanSequence(conn, { scanned_value, stage_id, product_id, currentSeq });
+      if (!validation.ok) {
+        return res.status(400).json({ success: false, message: validation.message });
+      }
     }
 
-    if (currentSeq < lastSeq) {
-      return res.status(400).json({
-        success: false,
-        message: "Backward scan not allowed: item has already progressed past this stage.",
-      });
+    switch (scan_mode) {
+      case "SINGLE":
+        return await handleSingleScan(conn, res, ctx);
+      case "GROUP_CREATE":
+        return await handleGroupCreate(conn, res, ctx);
+      case "GROUP_SCAN":
+        return await handleGroupScan(conn, res, ctx);
+      default:
+        return res.status(400).json({ success: false, message: "Invalid scan mode" });
     }
-
-    if (currentSeq > lastSeq + 1) {
-      const [missingFlow] = await conn.query(
-        `SELECT psf.sequence_no, s.name AS stage_name
-         FROM product_stage_flow psf
-         JOIN stages s ON s.id = psf.stage_id
-         WHERE psf.product_id = ? AND psf.sequence_no BETWEEN ? AND ?
-         ORDER BY psf.sequence_no ASC`,
-        [item.product_id, lastSeq + 1, currentSeq - 1]
-      );
-
-      const missingNames = missingFlow.map((f) => f.stage_name).join(", ");
-
-      return res.status(400).json({
-        success: false,
-        message: `This stage is missing: ${missingNames || `sequence ${lastSeq + 1}`} must be scanned before this stage.`,
-      });
-    }
-
-    // 6. Sequence is valid — insert scan_history
-    //    SINGLE: real-time, immediately treated as done.
-    //    GROUP_CREATE: still inserted now (so duplicate/backward checks
-    //    keep working), but stays ungrouped (group_id NULL) until a
-    //    separate "create group" action assigns a group_id later.
-    const [result] = await conn.query(
-      `INSERT INTO scan_history
-        (item_id, factory_id, line_id, stage_id, user_id, scanned_value, status, sequence_no, group_id)
-       VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?, NULL)`,
-      [item.id, factory_id, line_id, stage_id, userId, scanned_value, currentSeq]
-    );
-
-    return res.status(201).json({
-      success: true,
-      message:
-        scan_mode === "GROUP_CREATE"
-          ? "Scan recorded, pending group save."
-          : "Scan recorded successfully.",
-      data: {
-        id: result.insertId,
-        sequence_no: currentSeq,
-        scan_mode,
-        group_required,
-        pending_group: scan_mode === "GROUP_CREATE",
-      },
-    });
   } catch (error) {
     console.log("ERR IN SUBMIT SCAN:", error);
     return res.status(500).json({ success: false, message: error.message });
@@ -259,5 +260,98 @@ export const submitScan = async (req, res) => {
 };
 
 
+// ---- POST /scan-history/create-group ----
+export const createGroup = async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { scanned_values, product_id } = req.body;
+    const userId = req?.user?.id;
 
-export { createScanHistory };
+    if (!Array.isArray(scanned_values) || !scanned_values.length) {
+      return res.status(400).json({ success: false, message: "scanned_values array is required" });
+    }
+    if (!product_id) {
+      return res.status(400).json({ success: false, message: "product_id is required" });
+    }
+
+    // reject obvious client-side dupes before touching the DB
+    const uniqueValues = [...new Set(scanned_values.map((v) => String(v).trim()).filter(Boolean))];
+    if (uniqueValues.length !== scanned_values.length) {
+      return res.status(400).json({ success: false, message: "Duplicate codes found in the scanned batch." });
+    }
+
+    const [userRows] = await conn.query(
+      `SELECT id, factory_id, line_id, stage_id FROM users WHERE id = ?`,
+      [userId]
+    );
+    if (!userRows.length) {
+      return res.status(401).json({ success: false, message: "User not found" });
+    }
+    const { factory_id, line_id, stage_id } = userRows[0];
+    if (!stage_id) {
+      return res.status(400).json({ success: false, message: "User is not assigned to a stage" });
+    }
+
+    const [flowRows] = await conn.query(
+      `SELECT sequence_no, scan_mode FROM product_stage_flow WHERE product_id = ? AND stage_id = ?`,
+      [product_id, stage_id]
+    );
+    if (!flowRows.length) {
+      return res.status(400).json({ success: false, message: "This stage is not part of the product's flow" });
+    }
+    const { sequence_no: currentSeq, scan_mode } = flowRows[0];
+    if (scan_mode !== "GROUP_CREATE") {
+      return res.status(400).json({ success: false, message: "This stage does not use GROUP_CREATE mode" });
+    }
+
+    await conn.beginTransaction();
+
+    // validate every code before inserting anything
+    for (const scanned_value of uniqueValues) {
+      const check = await validateScanSequence(conn, { scanned_value, stage_id, product_id, currentSeq });
+      if (!check.ok) {
+        await conn.rollback();
+        return res.status(400).json({ success: false, message: check.message });
+      }
+    }
+
+    const group_code = `GRP-${stage_id}-${Date.now()}`;
+    const [groupResult] = await conn.query(
+      `INSERT INTO scan_groups (group_code, product_id, factory_id, line_id, stage_id, created_by)
+       VALUES (?,?,?,?,?,?)`,
+      [group_code, product_id, factory_id, line_id, stage_id, userId]
+    );
+    const groupId = groupResult.insertId;
+
+    const insertedIds = [];
+    for (const scanned_value of uniqueValues) {
+      const [result] = await conn.query(
+        `INSERT INTO scan_history
+         (factory_id, line_id, stage_id, user_id, scanned_value, sequence_no, status, group_id)
+         VALUES (?,?,?,?,?,?,'SUCCESS',?)`,
+        [factory_id, line_id, stage_id, userId, scanned_value, currentSeq, groupId]
+      );
+      insertedIds.push(result.insertId);
+    }
+
+    await conn.commit();
+
+    return res.status(201).json({
+      success: true,
+      message: "Group created successfully.",
+      data: {
+        group_id: groupId,
+        group_code,
+        sequence_no: currentSeq,
+        item_count: insertedIds.length,
+        scan_history_ids: insertedIds,
+      },
+    });
+  } catch (error) {
+    await conn.rollback();
+    console.log("ERR IN CREATE GROUP:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  } finally {
+    conn.release();
+  }
+};

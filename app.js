@@ -8,6 +8,8 @@ dotenv.config();
 import {connectDB} from "./DB/config/mysql.config.js";
 import { globalErrorHandler } from "./utils/AppError.js";
 
+import {verifyToken} from "./middleWare/auth.middleware.js";
+
 
 // Route imports
 import userRoutes from "./routes/user.routes.js";
@@ -27,6 +29,7 @@ import externalResultRoutes from "./routes/externalResult.routes.js";
 import externalSourceMappingRoutes from "./routes/externalSourceMapping.routes.js";
 import productionLineRoutes from "./routes/productionLine.controller.js";
 import factoryRoutes from "./routes/factory.routes.js";
+import ictRoutes from "./routes/ict.routes.js";
 
 const app = express();
 
@@ -62,9 +65,14 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok", uptime: process.uptime() });
 });
 
-// ---------- Routes ----------
+
 app.use("/api/users", userRoutes);
 app.use("/api/auth", authRoutes);
+app.use("/api/ict", ictRoutes);
+
+app.use(verifyToken); // Apply JWT verification middleware to all routes below
+
+// ---------- Routes ----------
 app.use("/api/categories", categoryRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/stages", stageRoutes);

@@ -1,4 +1,4 @@
-import {pool} from "../DB/config/mysql.config.js"
+import { pool } from "../DB/config/mysql.config.js";
 
 export const createProductStageFlow = async (req, res) => {
   try {
@@ -7,15 +7,34 @@ export const createProductStageFlow = async (req, res) => {
       stage_id,
       sequence_no,
       scan_mode,
-      group_required,
-      is_mandatory = 1,
+      is_external_dependency = 0,
+      external_source = null,
+      external_source_type = null,
+      external_folder_path = null,
+      external_poll_interval_minutes = null,
+      external_file_extensions = null,
+      external_api_config = null,
     } = req.body;
 
     const [result] = await pool.query(
       `INSERT INTO product_stage_flow
-      (product_id, stage_id, sequence_no, scan_mode, group_required, is_mandatory)
-      VALUES (?, ?, ?, ?, ?, ?)`,
-      [product_id, stage_id, sequence_no, scan_mode, group_required, is_mandatory]
+      (product_id, stage_id, sequence_no, scan_mode, is_external_dependency,
+       external_source, external_source_type, external_folder_path,
+       external_poll_interval_minutes, external_file_extensions, external_api_config)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        product_id,
+        stage_id,
+        sequence_no,
+        scan_mode,
+        is_external_dependency,
+        external_source,
+        external_source_type,
+        external_folder_path,
+        external_poll_interval_minutes,
+        external_file_extensions,
+        external_api_config,
+      ]
     );
 
     return res.status(201).json({
@@ -40,9 +59,14 @@ export const getProductStageFlows = async (req, res) => {
         psf.stage_id,
         s.name AS stage_name,
         psf.sequence_no,
-        psf.is_mandatory,
         psf.scan_mode,
-        psf.group_required
+        psf.is_external_dependency,
+        psf.external_source,
+        psf.external_source_type,
+        psf.external_folder_path,
+        psf.external_poll_interval_minutes,
+        psf.external_file_extensions,
+        psf.external_api_config
       FROM product_stage_flow psf
       JOIN products p ON p.id = psf.product_id
       JOIN stages s ON s.id = psf.stage_id
@@ -56,7 +80,7 @@ export const getProductStageFlows = async (req, res) => {
       message: error.message,
     });
   }
-};  
+};
 
 export const getProductFlowByProductId = async (req, res) => {
   try {
@@ -69,7 +93,14 @@ export const getProductFlowByProductId = async (req, res) => {
         psf.stage_id,
         s.name AS stage_name,
         psf.sequence_no,
-        psf.is_mandatory
+        psf.scan_mode,
+        psf.is_external_dependency,
+        psf.external_source,
+        psf.external_source_type,
+        psf.external_folder_path,
+        psf.external_poll_interval_minutes,
+        psf.external_file_extensions,
+        psf.external_api_config
       FROM product_stage_flow psf
       JOIN stages s ON s.id = psf.stage_id
       WHERE psf.product_id = ?
@@ -95,11 +126,14 @@ export const updateProductStageFlow = async (req, res) => {
       stage_id,
       sequence_no,
       scan_mode,
-      group_required,
-      is_mandatory,
+      is_external_dependency,
+      external_source,
+      external_source_type,
+      external_folder_path,
+      external_poll_interval_minutes,
+      external_file_extensions,
+      external_api_config,
     } = req.body;
-
-    console.log("Updating product stage flow :",req.body);
 
     const [result] = await pool.query(
       `
@@ -109,8 +143,13 @@ export const updateProductStageFlow = async (req, res) => {
         stage_id = ?,
         sequence_no = ?,
         scan_mode = ?,
-        group_required = ?,
-        is_mandatory = ?
+        is_external_dependency = ?,
+        external_source = ?,
+        external_source_type = ?,
+        external_folder_path = ?,
+        external_poll_interval_minutes = ?,
+        external_file_extensions = ?,
+        external_api_config = ?
       WHERE id = ?
       `,
       [
@@ -118,8 +157,13 @@ export const updateProductStageFlow = async (req, res) => {
         stage_id,
         sequence_no,
         scan_mode,
-        group_required,
-        is_mandatory,
+        is_external_dependency,
+        external_source,
+        external_source_type,
+        external_folder_path,
+        external_poll_interval_minutes,
+        external_file_extensions,
+        external_api_config,
         id,
       ]
     );
@@ -166,4 +210,3 @@ export const deleteProductStageFlow = async (req, res) => {
     });
   }
 };
-
