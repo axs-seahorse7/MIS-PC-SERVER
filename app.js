@@ -41,6 +41,13 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use((req, res, next) => {
+    res.on("finish", () => {
+        console.log(res.getHeaders());
+    });
+    next();
+});
+
 // ---------- Core Middleware ----------
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());

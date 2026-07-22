@@ -22,8 +22,11 @@ export const saveICTResult = async (req, res) => {
             machineName
         });
 
-        // TODO:
-        // Insert into MySQL
+        const [resultRows] = await pool.query(
+            "INSERT INTO ict_results (serial_no, program, result, machine_name) VALUES (?, ?, ?, ?)",
+            [serialNo, program, result, machineName]
+        );
+        
 
         const endTime = process.hrtime.bigint();
 

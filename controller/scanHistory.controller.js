@@ -58,10 +58,39 @@ const handleSingleScan = async (conn, res, ctx) => {
   });
 };
 
+
+const checkExternalDependency = async (conn, { stage_name, external_source, external_source_type, scanned_value }) => {
+  if (external_source_type !== "LOCAL_FILE") {
+    // API-backed external sources aren't implemented yet — nothing to check against.
+    return { ok: true };
+  }
+ 
+  const machineName = external_source; // configured per stage, e.g. "ICT-01"
+ 
+  if (stage_name?.toUpperCase() === "ICT") {
+    const [rows] = await conn.query(
+      `SELECT result FROM ict_results
+       WHERE machine_name = ? AND serial_no = ?
+       ORDER BY imported_at DESC
+       LIMIT 1`,
+      [machineName, scanned_value]
+    );
+ 
+    if (!rows.length) {
+      return { ok: false, message: "ICT scan required" };
+    }
+    if (rows[0].result !== "PASS") {
+      return { ok: false, message: "ICT FAILED" };
+    }
+    return { ok: true };
+  }
+ 
+  console.warn(`No external-result table wired up for stage "${stage_name}" yet — skipping check.`);
+  return { ok: true };
+};
+
+
 // ---- GROUP_CREATE ----
-// Item is inserted immediately (SUCCESS, group_id NULL) so sequence/duplicate
-// checks keep working for the *next* item scanned. It stays "pending" until
-// the frontend calls POST /scan/create-group with the ids to finalize.
 const handleGroupCreate = async (conn, res, ctx) => {
   const { factory_id, line_id, stage_id, userId, scanned_value, currentSeq } = ctx;
   const [result] = await conn.query(
@@ -91,8 +120,6 @@ const handleGroupCreate = async (conn, res, ctx) => {
 };
 
 // ---- GROUP_SCAN ----
-// scanned_value here is assumed to be the GROUP CODE (not an item code).
-// Every member item of the group is validated + advanced to this stage together.
 const handleGroupScan = async (conn, res, ctx) => {
   const { factory_id, line_id, stage_id, userId, scanned_value: code, product_id, currentSeq } = ctx;
 
@@ -190,6 +217,76 @@ const handleGroupScan = async (conn, res, ctx) => {
 };
 
 // ---- dispatcher ----
+// export const submitScan = async (req, res) => {
+//   const conn = await pool.getConnection();
+//   try {
+//     const { scanned_value, product_id } = req.body;
+//     const userId = req?.user?.id;
+
+//     if (!scanned_value) {
+//       return res.status(400).json({ success: false, message: "Scanned code is required" });
+//     }
+//     if (!product_id) {
+//       return res.status(400).json({ success: false, message: "product_id is required" });
+//     }
+
+//     const [userRows] = await conn.query(
+//       `SELECT id, factory_id, line_id, stage_id FROM users WHERE id = ?`,
+//       [userId]
+//     );
+//     if (!userRows.length) {
+//       return res.status(401).json({ success: false, message: "User not found" });
+//     }
+//     const { factory_id, line_id, stage_id } = userRows[0];
+//     if (!stage_id) {
+//       return res.status(400).json({ success: false, message: "User is not assigned to a stage" });
+//     }
+
+//     // is_mandatory / group_required are gone. is_external_dependency and
+//     // external_source are pulled through too, in case downstream logic
+//     // needs to flag/display an external dependency later.
+//     const [flowRows] = await conn.query(
+//       `SELECT id, sequence_no, scan_mode, is_external_dependency, external_source
+//        FROM product_stage_flow
+//        WHERE product_id = ? AND stage_id = ?`,
+//       [product_id, stage_id]
+//     );
+
+//     if (!flowRows.length) {
+//       return res.status(400).json({ success: false, message: "This stage is not part of the product's flow" });
+//     }
+
+//     const { sequence_no: currentSeq, scan_mode, is_external_dependency, external_source } = flowRows[0];
+
+//     const ctx = { factory_id, line_id, stage_id, userId, scanned_value, product_id, currentSeq };
+
+
+//     if (scan_mode !== "GROUP_SCAN") {
+//       const validation = await validateScanSequence(conn, { scanned_value, stage_id, product_id, currentSeq });
+//       if (!validation.ok) {
+//         return res.status(400).json({ success: false, message: validation.message });
+//       }
+//     }
+
+//     switch (scan_mode) {
+//       case "SINGLE":
+//         return await handleSingleScan(conn, res, ctx);
+//       case "GROUP_CREATE":
+//         return await handleGroupCreate(conn, res, ctx);
+//       case "GROUP_SCAN":
+//         return await handleGroupScan(conn, res, ctx);
+//       default:
+//         return res.status(400).json({ success: false, message: "Invalid scan mode" });
+//     }
+//   } catch (error) {
+//     console.log("ERR IN SUBMIT SCAN:", error);
+//     return res.status(500).json({ success: false, message: error.message });
+//   } finally {
+//     conn.release();
+//   }
+// };
+
+
 export const submitScan = async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -215,29 +312,50 @@ export const submitScan = async (req, res) => {
       return res.status(400).json({ success: false, message: "User is not assigned to a stage" });
     }
 
-    // is_mandatory / group_required are gone. is_external_dependency and
-    // external_source are pulled through too, in case downstream logic
-    // needs to flag/display an external dependency later.
+    // joined with stages so we know the stage NAME (e.g. "ICT"), needed to
+    // pick the right external-results table.
     const [flowRows] = await conn.query(
-      `SELECT id, sequence_no, scan_mode, is_external_dependency, external_source
-       FROM product_stage_flow
-       WHERE product_id = ? AND stage_id = ?`,
+      `SELECT psf.id, psf.sequence_no, psf.scan_mode, psf.is_external_dependency,
+              psf.external_source, psf.external_source_type, s.name AS stage_name
+       FROM product_stage_flow psf
+       JOIN stages s ON s.id = psf.stage_id
+       WHERE psf.product_id = ? AND psf.stage_id = ?`,
       [product_id, stage_id]
     );
-
     if (!flowRows.length) {
       return res.status(400).json({ success: false, message: "This stage is not part of the product's flow" });
     }
-
-    const { sequence_no: currentSeq, scan_mode, is_external_dependency, external_source } = flowRows[0];
+    const {
+      sequence_no: currentSeq,
+      scan_mode,
+      is_external_dependency,
+      external_source,
+      external_source_type,
+      stage_name,
+    } = flowRows[0];
 
     const ctx = { factory_id, line_id, stage_id, userId, scanned_value, product_id, currentSeq };
 
-
+    // GROUP_SCAN validates per-member inside handleGroupScan, not here.
     if (scan_mode !== "GROUP_SCAN") {
       const validation = await validateScanSequence(conn, { scanned_value, stage_id, product_id, currentSeq });
       if (!validation.ok) {
         return res.status(400).json({ success: false, message: validation.message });
+      }
+    }
+
+    // External dependency gate — SINGLE mode only for now (e.g. ICT/FCT
+    // gating before Packing). GROUP_CREATE/GROUP_SCAN aren't wired up yet;
+    // extend this condition when those need the same check.
+    if (scan_mode === "SINGLE" && is_external_dependency) {
+      const depCheck = await checkExternalDependency(conn, {
+        stage_name,
+        external_source,
+        external_source_type,
+        scanned_value,
+      });
+      if (!depCheck.ok) {
+        return res.status(400).json({ success: false, message: depCheck.message });
       }
     }
 
