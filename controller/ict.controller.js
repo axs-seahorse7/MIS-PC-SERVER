@@ -1,5 +1,17 @@
 import { pool } from "../DB/config/mysql.config.js";
 
+
+const normalizeResult = (result) => {
+    if (!result) return null;
+
+    const value = result.trim().toUpperCase();
+
+    const match = value.match(/\b(PASS|FAIL)\b/);
+
+    return match ? match[1] : null;
+};
+
+
 export const saveICTResult = async (req, res) => {
 
     const startTime = process.hrtime.bigint();
@@ -10,21 +22,48 @@ export const saveICTResult = async (req, res) => {
             serialNo,
             program,
             result,
-            machineName
+            machineName,
+            machineCode,
         } = req.body;
+
+        const cleanResult = normalizeResult(result);
+        console.log(`Cleaned Result: ${cleanResult}`);
+
+        if (!["PASS", "FAIL"].includes(cleanResult)) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid machine result: ${cleanResult}`
+            });
+        }
 
         console.log("====================================");
         console.log("📥 ICT Result Received");
         console.log({
             serialNo,
             program,
-            result,
-            machineName
+            cleanResult,
+            machineName,
+            machineCode
         });
 
+        if(!serialNo || !cleanResult || !machineName || !machineCode) {
+            const endTime = process.hrtime.bigint();
+            const elapsedMs = Number(endTime - startTime) / 1_000_000;
+
+            console.error("❌ Missing required fields");
+            console.log(`⚡ Failed after: ${elapsedMs.toFixed(2)} ms`);
+            return res.status(400).json({
+                success: false,
+                processingTime: `${elapsedMs.toFixed(2)} ms`,
+                message: "Missing required fields"
+            });
+        }
+        
+        
+
         const [resultRows] = await pool.query(
-            "INSERT INTO ict_results (serial_no, program, result, machine_name) VALUES (?, ?, ?, ?)",
-            [serialNo, program, result, machineName]
+            "INSERT INTO ict_results (serial_no, program, result, machine_name, machine_code) VALUES (?, ?, ?, ?, ?)",
+            [serialNo, program, cleanResult, machineName, machineCode]
         );
         
 

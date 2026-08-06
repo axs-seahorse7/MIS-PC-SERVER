@@ -108,3 +108,27 @@ export const deleteProductionLine = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+
+export const getLinesByFactoryId = async (req, res) => {
+  try {
+    const { factoryId } = req.params;
+
+    if(!factoryId || isNaN(factoryId)) {
+      return res.status(400).json({ message: "Invalid factory ID" });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT * FROM production_lines WHERE factory_id = ?`,
+      [factoryId]
+    );
+
+    if(!rows.length) {
+      return res.status(404).json({ message: "No production lines found for this factory" });
+    }
+
+   return res.json(rows);
+  } catch (error) {
+    console.error(error);
+   return res.status(500).json({ message: error.message });
+  }
+}

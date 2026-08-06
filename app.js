@@ -30,6 +30,7 @@ import externalSourceMappingRoutes from "./routes/externalSourceMapping.routes.j
 import productionLineRoutes from "./routes/productionLine.controller.js";
 import factoryRoutes from "./routes/factory.routes.js";
 import ictRoutes from "./routes/ict.routes.js";
+import productionTargetRoutes from "./routes/productionTarget.routes.js";
 
 const app = express();
 
@@ -41,12 +42,12 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-    res.on("finish", () => {
-        console.log(res.getHeaders());
-    });
-    next();
-});
+// app.use((req, res, next) => {
+//     res.on("finish", () => {
+//         console.log(res.getHeaders());
+//     });
+//     next();
+// });
 
 // ---------- Core Middleware ----------
 app.use(express.json({ limit: "10mb" }));
@@ -77,6 +78,7 @@ app.use("/api/users", userRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/ict", ictRoutes);
 
+app.use("/api/external-sources", externalSourceRoutes);
 app.use(verifyToken); // Apply JWT verification middleware to all routes below
 
 // ---------- Routes ----------
@@ -90,12 +92,11 @@ app.use("/api/items", itemsRoutes);
 app.use("/api/item-field-values", itemFieldValuesRoutes);
 app.use("/api/scan-history", scanHistoryRoutes);
 app.use("/api/fct", fctRoutes);
-app.use("/api/external-sources", externalSourceRoutes);
 app.use("/api/external-results", externalResultRoutes);
 app.use("/api/external-source-mappings", externalSourceMappingRoutes);
 app.use("/api/production-lines", productionLineRoutes);
 app.use("/api/factories", factoryRoutes);
-
+app.use("/api/production-targets", productionTargetRoutes);
 
 
 // ---------- 404 ----------
