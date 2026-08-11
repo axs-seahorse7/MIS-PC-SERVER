@@ -1,4 +1,5 @@
 import { pool } from "../DB/config/mysql.config.js";
+import { processPackagingScan } from "../service/scan-history-services/processPackagingScan.servic.js";
 
 
 
@@ -154,67 +155,132 @@ const validateScanSequence = async (
 
 // ---- SINGLE ----
 const handleSingleScan = async (conn, res, ctx) => {
-  const {
-    factory_id,
-    line_id,
-    stage_id,
-    userId,
-    scanned_value,
-    currentSeq,
-    product_id,
-    lastSequence,
-  } = ctx;
 
-  await conn.beginTransaction();
-
-  try {
-    const [result] = await conn.query(
-      `INSERT INTO scan_history
-       (factory_id, line_id, stage_id, user_id, scanned_value, sequence_no, status, group_id)
-       VALUES (?,?,?,?,?,?,'SUCCESS',NULL)`,
-      [
+    const {
         factory_id,
         line_id,
         stage_id,
         userId,
         scanned_value,
         currentSeq,
-      ]
-    );
+        product_id,
+        lastSequence,
 
-    await syncProduction(conn, {
-      scanned_value,
-      product_id,
-      factory_id,
-      line_id,
-      stage_id,
-      currentSeq,
-      lastSequence,
-    });
+        // Packaging
+        packaging_config_id,
+        box_size,
+        printer_id,
+        barcode_format,
 
-    await conn.commit();
+    } = ctx;
 
-    return res.status(201).json({
-      success: true,
-      message: "Scan recorded successfully.",
-      data: {
-        id: result.insertId,
-        sequence_no: currentSeq,
-        scan_mode: "SINGLE",
-        pending_group: false,
-      },
-    });
+    const isPackagingStage = !!packaging_config_id;
 
-  } catch (error) {
+    await conn.beginTransaction();
 
-    await conn.rollback();
-    throw error;
+    try {
 
-  }
+        // --------------------------------------------------
+        // 1. Save scan history
+        // --------------------------------------------------
+
+        const [result] = await conn.query(
+            `
+            INSERT INTO scan_history
+            (
+                factory_id,
+                line_id,
+                stage_id,
+                user_id,
+                scanned_value,
+                sequence_no,
+                status,
+                group_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', NULL)
+            `,
+            [
+                factory_id,
+                line_id,
+                stage_id,
+                userId,
+                scanned_value,
+                currentSeq
+            ]
+        );
+
+
+        // --------------------------------------------------
+        // 2. Update PCB production
+        // --------------------------------------------------
+
+        await syncProduction(conn, {
+            scanned_value,
+            product_id,
+            factory_id,
+            line_id,
+            stage_id,
+            currentSeq,
+            lastSequence
+        });
+
+
+        // --------------------------------------------------
+        // 3. Packaging
+        // --------------------------------------------------
+
+        let packagingResult = null;
+
+        if (isPackagingStage) {
+
+            packagingResult = await processPackagingScan(conn, {
+                product_id,
+                stage_id,
+                scanned_value,
+                box_size,
+                printer_id,
+                barcode_format
+            });
+        }
+
+
+        // --------------------------------------------------
+        // 4. Commit
+        // --------------------------------------------------
+
+        await conn.commit();
+
+
+        // --------------------------------------------------
+        // 5. Response
+        // --------------------------------------------------
+
+        return res.status(201).json({
+
+            success: true,
+
+            message: "Scan recorded successfully.",
+
+            data: {
+                id: result.insertId,
+                sequence_no: currentSeq,
+                scan_mode: "SINGLE",
+                pending_group: false,
+
+                packaging: packagingResult
+            }
+        });
+
+
+    } catch (error) {
+
+        await conn.rollback();
+
+        throw error;
+    }
 };
 
-const checkExternalDependency = async (
-  conn,
+const checkExternalDependency = async (conn,
   {
     stage_name,
     external_source_type,
@@ -544,7 +610,8 @@ export const submitScan = async (req, res) => {
     // joined with stages so we know the stage NAME (e.g. "ICT"), needed to
     // pick the right external-results table.
     const [flowRows] = await conn.query(
-      `SELECT
+      `
+      SELECT
           psf.id,
           psf.sequence_no,
           psf.scan_mode,
@@ -553,7 +620,14 @@ export const submitScan = async (req, res) => {
           psf.external_source_type,
           psf.external_machine_type,
           psf.machine_code,
+
           s.name AS stage_name,
+
+          /* Packaging configuration */
+          pc.id AS packaging_config_id,
+          pc.box_size,
+          pc.printer_id,
+          pc.barcode_format,
 
           (
               SELECT MAX(sequence_no)
@@ -562,10 +636,18 @@ export const submitScan = async (req, res) => {
           ) AS last_sequence
 
       FROM product_stage_flow psf
+
       JOIN stages s
           ON s.id = psf.stage_id
+
+      LEFT JOIN packaging_config pc
+          ON pc.product_id = psf.product_id
+          AND pc.stage_id = psf.stage_id
+          AND pc.is_active = 1
+
       WHERE psf.product_id = ?
-        AND psf.stage_id = ?;`,
+        AND psf.stage_id = ?;
+      `,
       [product_id, stage_id]
     );
 
@@ -578,27 +660,43 @@ export const submitScan = async (req, res) => {
     const {
       sequence_no: currentSeq,
       last_sequence: lastSequence,
+
       scan_mode,
+
       is_external_dependency,
       external_source,
       external_source_type,
       external_machine_type,
       machine_code,
+
       stage_name,
+
+      // Packaging
+      packaging_config_id,
+      box_size,
+      printer_id,
+      barcode_format,
     } = flowRows[0];
 
-    const ctx = { factory_id, line_id, stage_id, userId, scanned_value, product_id, currentSeq, lastSequence };
 
-    console.log({
-      stage_name,
+    const ctx = {
+      factory_id,
+      line_id,
+      stage_id,
+      userId,
+      scanned_value,
+      product_id,
+
       currentSeq,
-      scan_mode,
-      is_external_dependency,
-      external_source,
-      external_source_type,
-      external_machine_type,
-      machine_code
-    });
+      lastSequence,
+
+      // Packaging
+      packaging_config_id,
+      box_size,
+      printer_id,
+      barcode_format
+    };
+
 
     // GROUP_SCAN validates per-member inside handleGroupScan, not here.
     if (scan_mode !== "GROUP_SCAN") {
@@ -640,6 +738,7 @@ export const submitScan = async (req, res) => {
       default:
         return res.status(400).json({ success: false, message: "Invalid scan mode" });
     }
+
   } catch (error) {
     console.log("ERR IN SUBMIT SCAN:", error);
     return res.status(500).json({ success: false, message: error.message });

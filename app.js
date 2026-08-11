@@ -31,6 +31,8 @@ import productionLineRoutes from "./routes/productionLine.controller.js";
 import factoryRoutes from "./routes/factory.routes.js";
 import ictRoutes from "./routes/ict.routes.js";
 import productionTargetRoutes from "./routes/productionTarget.routes.js";
+import packegingConfigRoutes from "./routes/packegingConfig.routes.js";
+import printerRoutes from "./routes/printers.route.js";
 
 const app = express();
 
@@ -97,6 +99,8 @@ app.use("/api/external-source-mappings", externalSourceMappingRoutes);
 app.use("/api/production-lines", productionLineRoutes);
 app.use("/api/factories", factoryRoutes);
 app.use("/api/production-targets", productionTargetRoutes);
+app.use("/api/packaging-config", packegingConfigRoutes);
+app.use("/api/printers", printerRoutes);
 
 
 // ---------- 404 ----------
