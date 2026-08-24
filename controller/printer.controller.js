@@ -167,3 +167,4 @@ export const deletePrinter = asyncHandler(async (req, res) => {
 
   res.status(200).json({ message: "Printer deleted" });
 });
+

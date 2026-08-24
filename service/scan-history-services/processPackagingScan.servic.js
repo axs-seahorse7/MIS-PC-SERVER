@@ -1,3 +1,5 @@
+import {generateNextBarcode} from "../BarCode-Generator/barCodeGenerator.js";
+
 export const processPackagingScan = async (
     conn,
     {
@@ -6,7 +8,9 @@ export const processPackagingScan = async (
         scanned_value,
         box_size,
         printer_id,
-        barcode_format
+        barcode_format,
+        packaging_config_id,
+        printer_name,
     }
 ) => {
 
@@ -19,6 +23,7 @@ export const processPackagingScan = async (
         SELECT
             id,
             box_code,
+            barcode_data,
             product_id,
             packaging_stage_id,
             box_size,
@@ -46,24 +51,37 @@ export const processPackagingScan = async (
 
     if (!boxRows.length) {
 
+        if (!packaging_config_id) {
+            throw new Error(
+                "No packaging rule configured for this product/stage — cannot generate a box barcode."
+            );
+        }
+
         const boxCode =
             `BOX-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+        const barcodeData = await generateNextBarcode(
+            conn,
+            packaging_config_id
+        );
 
         const [insertBox] = await conn.query(
             `
             INSERT INTO boxes
             (
                 box_code,
+                barcode_data,
                 product_id,
                 packaging_stage_id,
                 box_size,
                 actual_quantity,
                 status
             )
-            VALUES (?, ?, ?, ?, 0, 'OPEN')
+            VALUES (?, ?, ?, ?, ?, 0, 'OPEN')
             `,
             [
                 boxCode,
+                barcodeData,
                 product_id,
                 stage_id,
                 box_size
@@ -73,6 +91,7 @@ export const processPackagingScan = async (
         box = {
             id: insertBox.insertId,
             box_code: boxCode,
+            barcode_data: barcodeData,
             product_id,
             packaging_stage_id: stage_id,
             box_size,
@@ -83,6 +102,40 @@ export const processPackagingScan = async (
     } else {
 
         box = boxRows[0];
+
+        // --------------------------------------------------
+        // Safety: Existing box has no barcode
+        // --------------------------------------------------
+
+        if (!box.barcode_data) {
+
+            if (!packaging_config_id) {
+                throw new Error(
+                    `Box ${box.box_code} has no barcode_data and no packaging configuration is available.`
+                );
+            }
+
+            const barcodeData = await generateNextBarcode(
+                conn,
+                packaging_config_id
+            );
+
+            await conn.query(
+                `
+                UPDATE boxes
+                SET
+                    barcode_data = ?,
+                    updated_at = NOW()
+                WHERE id = ?
+                `,
+                [
+                    barcodeData,
+                    box.id
+                ]
+            );
+
+            box.barcode_data = barcodeData;
+        }
     }
 
 
@@ -90,7 +143,7 @@ export const processPackagingScan = async (
     // 3. Safety check
     // --------------------------------------------------
 
-    if (box.actual_quantity >= box.box_size) {
+    if (Number(box.actual_quantity) >= Number(box.box_size)) {
         throw new Error(
             `Box ${box.box_code} is already full.`
         );
@@ -114,7 +167,6 @@ export const processPackagingScan = async (
     );
 
     if (existingItem.length) {
-
         throw new Error(
             `"${scanned_value}" is already assigned to a box.`
         );
@@ -175,13 +227,11 @@ export const processPackagingScan = async (
         );
 
 
-        // ----------------------------------------------
-        // Create print job
-        // ----------------------------------------------
+        // --------------------------------------------------
+        // Create print job ONLY when box is full
+        // --------------------------------------------------
 
-        const barcodeData = box.box_code;
-
-        await conn.query(
+        const [printJobResult] = await conn.query(
             `
             INSERT INTO box_print_jobs
             (
@@ -195,7 +245,7 @@ export const processPackagingScan = async (
             [
                 box.id,
                 printer_id,
-                barcodeData
+                box.barcode_data
             ]
         );
 
@@ -204,11 +254,13 @@ export const processPackagingScan = async (
             box_completed: true,
             box_id: box.id,
             box_code: box.box_code,
+            barcode_data: box.barcode_data,
+            print_job_id: printJobResult.insertId,
+            printer_name,
             quantity: newQuantity,
             box_size: box.box_size,
             status: "PACKED",
             print_job_created: true,
-            barcode_data: barcodeData,
             barcode_format
         };
     }
@@ -234,12 +286,20 @@ export const processPackagingScan = async (
     );
 
 
+    // --------------------------------------------------
+    // No print job until box is FULL
+    // --------------------------------------------------
+
     return {
         box_completed: false,
         box_id: box.id,
         box_code: box.box_code,
+        barcode_data: box.barcode_data,
+        printer_name,
         quantity: newQuantity,
         box_size: box.box_size,
-        status: "PACKING"
+        status: "PACKING",
+        print_job_created: false,
+        barcode_format
     };
 };

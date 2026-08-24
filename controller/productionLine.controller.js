@@ -47,28 +47,101 @@ export const getProductionLineById = async (req, res) => {
   }
 };
 
-// Create
-export const createProductionLine = async (req, res) => {
-  try {
-    const { factory_id, name, code, description, is_active = true } = req.body;
 
-    const [result] = await pool.query(
-      `INSERT INTO production_lines
-        (factory_id, name, code, description, is_active)
-      VALUES (?, ?, ?, ?, ?)`,
-      [factory_id, name, code, description || null, is_active]
+// create
+export const createProductionLine = async (req, res) => {
+  const connection = await pool.getConnection();
+
+  try {
+    const {factory_id, name,description, is_active = true,} = req.body;
+
+    if (!factory_id) {
+      return res.status(400).json({
+        message: "Factory ID is required",
+      });
+    }
+
+    if (!name?.trim()) {
+      return res.status(400).json({
+        message: "Production line name is required",
+      });
+    }
+
+    const cleanName = name.replace(/[^a-zA-Z]/g, "");
+
+    if (cleanName.length < 3) {
+      return res.status(400).json({
+        message: "Production line name must contain at least 3 letters",
+      });
+    }
+
+    const prefix = cleanName.substring(0, 3).toUpperCase();
+
+    await connection.beginTransaction();
+
+    // Get the latest code for this factory + prefix
+    const [rows] = await connection.query(
+      `
+      SELECT code
+      FROM production_lines
+      WHERE factory_id = ?
+        AND code LIKE ?
+      ORDER BY CAST(SUBSTRING(code, 4) AS UNSIGNED) DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [factory_id, `${prefix}%`]
     );
 
-    res.status(201).json({
+    let nextNumber = 1;
+
+    if (rows.length > 0) {
+      const lastNumber = parseInt(rows[0].code.substring(3), 10);
+      nextNumber = lastNumber + 1;
+    }
+
+    const code = `${prefix}${String(nextNumber).padStart(4, "0")}`;
+
+    const [result] = await connection.query(
+      `
+      INSERT INTO production_lines
+        (factory_id, name, code, description, is_active)
+      VALUES (?, ?, ?, ?, ?)
+      `,
+      [
+        factory_id,
+        name.trim(),
+        code,
+        description || null,
+        is_active,
+      ]
+    );
+
+    await connection.commit();
+
+    return res.status(201).json({
       message: "Production line created successfully",
       id: result.insertId,
+      code,
     });
+
   } catch (error) {
-    console.error(error);
+    await connection.rollback();
+
+    console.error("Create production line error:", error);
+
     if (error.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "Line code already exists" });
+      return res.status(409).json({
+        message: "Production line code already exists",
+      });
     }
-    res.status(500).json({ message: error.message });
+
+    return res.status(500).json({
+      message: error.message,
+    });
+
+  } finally {
+    connection.release();
   }
 };
 
@@ -76,22 +149,34 @@ export const createProductionLine = async (req, res) => {
 export const updateProductionLine = async (req, res) => {
   try {
     const { id } = req.params;
-    const { factory_id, name, code, description, is_active } = req.body;
+    const { factory_id, name, description, is_active } = req.body;
 
     await pool.query(
       `UPDATE production_lines
-        SET factory_id = ?, name = ?, code = ?, description = ?, is_active = ?
-      WHERE id = ?`,
-      [factory_id, name, code, description || null, is_active, id]
+       SET factory_id = ?,
+           name = ?,
+           description = ?,
+           is_active = ?
+       WHERE id = ?`,
+      [
+        factory_id,
+        name,
+        description || null,
+        is_active,
+        id,
+      ]
     );
 
-    res.json({ message: "Production line updated successfully" });
+    res.json({
+      message: "Production line updated successfully",
+    });
+
   } catch (error) {
     console.error(error);
-    if (error.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "Line code already exists" });
-    }
-    res.status(500).json({ message: error.message });
+
+    res.status(500).json({
+      message: error.message,
+    });
   }
 };
 
