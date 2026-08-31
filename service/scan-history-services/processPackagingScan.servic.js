@@ -14,6 +14,8 @@ export const processPackagingScan = async (
     }
 ) => {
 
+    
+
     // --------------------------------------------------
     // 1. Find current open box
     // --------------------------------------------------
@@ -199,8 +201,7 @@ export const processPackagingScan = async (
     // 6. Calculate quantity
     // --------------------------------------------------
 
-    const newQuantity =
-        Number(box.actual_quantity) + 1;
+    const newQuantity = Number(box.actual_quantity) + 1;
 
 
     // --------------------------------------------------
@@ -250,18 +251,45 @@ export const processPackagingScan = async (
         );
 
 
+        // --------------------------------------------------
+        // Get label data
+        // --------------------------------------------------
+
+        const [productRows] = await conn.query(
+            `
+            SELECT
+                name,
+                part_code,
+                erp_no
+            FROM products
+            WHERE id = ?
+            LIMIT 1
+            `,
+            [product_id]
+        );
+
+        const product = productRows[0];
+
         return {
             box_completed: true,
             box_id: box.id,
             box_code: box.box_code,
             barcode_data: box.barcode_data,
+
+            product_name: product?.name ?? null,
+            part_code: product?.part_code ?? null,
+            sap_code: product?.erp_no ?? null,
+
             print_job_id: printJobResult.insertId,
             printer_name,
+
             quantity: newQuantity,
             box_size: box.box_size,
             status: "PACKED",
             print_job_created: true,
-            barcode_format
+            barcode_format,
+
+            packed_at: new Date()
         };
     }
 
@@ -302,4 +330,5 @@ export const processPackagingScan = async (
         print_job_created: false,
         barcode_format
     };
+    
 };

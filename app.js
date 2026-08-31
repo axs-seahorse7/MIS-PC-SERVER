@@ -43,7 +43,9 @@ const app = express();
 connectDB();
 
 app.use((req, res, next) => {
+  
   console.log(`[${new Date().getHours()}:${new Date().getMinutes()}:${new Date().getSeconds()}] : [${req.method}] > ${req.url} [ORIGIN] >  ${req.headers.origin}`);
+  console.log(`Hii this is the request body: ${JSON.stringify(req.body)}`);
   next();
 });
 
@@ -77,6 +79,7 @@ if (process.env.NODE_ENV !== "production") {
 app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok", uptime: process.uptime() });
 });
+
 
 
 app.use("/api/users", userRoutes);

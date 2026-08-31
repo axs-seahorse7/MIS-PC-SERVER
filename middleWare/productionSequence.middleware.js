@@ -334,7 +334,5 @@ const getExpectedSerial = async (productionOrderId, sequence) => {
     ]
   );
 
-  return rows.length > 0
-    ? rows[0].serial_no
-    : null;
+  return rows.length > 0 ? rows[0].serial_no : null;
 };

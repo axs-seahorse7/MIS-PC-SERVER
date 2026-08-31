@@ -5,7 +5,6 @@ const normalizeResult = (result) => {
     if (!result) return null;
 
     const value = result.trim().toUpperCase();
-
     const match = value.match(/\b(PASS|FAIL)\b/);
 
     return match ? match[1] : null;
@@ -13,11 +12,9 @@ const normalizeResult = (result) => {
 
 
 export const saveICTResult = async (req, res) => {
-
     const startTime = process.hrtime.bigint();
 
     try {
-
         const {
             serialNo,
             program,
@@ -26,8 +23,9 @@ export const saveICTResult = async (req, res) => {
             machineCode,
         } = req.body;
 
+        
+
         const cleanResult = normalizeResult(result);
-        console.log(`Cleaned Result: ${cleanResult}`);
 
         if (!["PASS", "FAIL"].includes(cleanResult)) {
             return res.status(400).json({
@@ -37,7 +35,7 @@ export const saveICTResult = async (req, res) => {
         }
 
         console.log("====================================");
-        console.log("📥 ICT Result Received");
+        console.log("📥 External Result Received");
         console.log({
             serialNo,
             program,
@@ -79,6 +77,7 @@ export const saveICTResult = async (req, res) => {
             processingTime: `${elapsedMs.toFixed(2)} ms`,
             message: "ICT result saved."
         });
+
 
     } catch (err) {
 

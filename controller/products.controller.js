@@ -11,6 +11,7 @@ export const createProducts = async (req, res) => {
       remarks,
       autoGenerateErp,
       erpNo: manualErpNo,
+      partCode,
     } = req.body;
 
     if (!categoryId) {
@@ -118,8 +119,8 @@ export const createProducts = async (req, res) => {
     const [result] = await connection.query(
       `
       INSERT INTO products
-        (category_id, name, description, remarks, erp_no)
-      VALUES (?, ?, ?, ?, ?)
+        (category_id, name, description, remarks, erp_no, part_code)
+      VALUES (?, ?, ?, ?, ?, ?)
       `,
       [
         categoryId,
@@ -127,6 +128,7 @@ export const createProducts = async (req, res) => {
         description || null,
         remarks || null,
         erpNo,
+        partCode || null,
       ]
     );
 
@@ -170,6 +172,7 @@ export const updateProduct = async (req, res) => {
       remarks,
       autoGenerateErp,
       erpNo: manualErpNo,
+      partCode,
     } = req.body;
 
     await connection.beginTransaction();
@@ -247,14 +250,14 @@ export const updateProduct = async (req, res) => {
     const [result] = await connection.query(
       erpNo
         ? `UPDATE products
-           SET category_id = ?, name = ?, description = ?, remarks = ?, erp_no = ?
+           SET category_id = ?, name = ?, description = ?, remarks = ?, erp_no = ?, part_code = ?
            WHERE id = ?`
         : `UPDATE products
            SET category_id = ?, name = ?, description = ?, remarks = ?
            WHERE id = ?`,
       erpNo
-        ? [categoryId, name, description, remarks, erpNo, id]
-        : [categoryId, name, description, remarks, id]
+        ? [categoryId, name, description, remarks, erpNo, partCode, id]
+        : [categoryId, name, description, remarks, partCode, id]
     );
 
     if (result.affectedRows === 0) {
@@ -267,6 +270,7 @@ export const updateProduct = async (req, res) => {
     return res.status(200).json({
       message: "Product updated successfully",
       erpNo,
+      partCode,
     });
   } catch (error) {
     await connection.rollback();
@@ -360,6 +364,7 @@ export const getProducts = async (req, res) => {
         p.id,
         p.name,
         p.erp_no,
+        p.part_code,
         p.description,
 
         po.id AS production_order_id,
@@ -454,6 +459,7 @@ export const getProductsForAdmin = async (req, res) => {
         category_id,
         name,
         erp_no,
+        part_code,
         description,
         remarks,
         is_active,
@@ -487,7 +493,7 @@ export const getProductsByCategory = async (req, res) => {
     }
 
     const [rows] = await pool.query(
-      `SELECT id, category_id, name, description, erp_no, 
+      `SELECT id, category_id, name, description, erp_no, part_code
        FROM products
        WHERE category_id = ? AND is_active = 1
        ORDER BY name ASC`,

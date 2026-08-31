@@ -1619,11 +1619,422 @@ const handleGroupScan = async (conn, res, ctx) => {
 };
 
 
+export const handleCustomerBinding = async (conn, res, ctx) => {
+  const {
+    factory_id,
+    line_id,
+    stage_id,
+    userId,
+    scanned_value,
+    customer_qr,
+    product_id,
+    currentSeq,
+    lastSequence,
+  } = ctx;
+
+  console.log("CUSTOMER BINDING CTX:", ctx);
+
+  const pcbQr = String(scanned_value || "").trim();
+  const customerQr = String(customer_qr || "").trim();
+
+  // ============================================================
+  // 1. Basic validation
+  // ============================================================
+
+  if (!pcbQr) {
+    return res.status(400).json({
+      success: false,
+      errorType: "PCB_QR_REQUIRED",
+      message: "PCB QR is required.",
+    });
+  }
+
+  if (!customerQr) {
+    return res.status(400).json({
+      success: false,
+      errorType: "CUSTOMER_QR_REQUIRED",
+      message: "Customer QR is required.",
+    });
+  }
+
+  // ============================================================
+  // 2. PCB QR and Customer QR cannot be same
+  // ============================================================
+
+  if (pcbQr === customerQr) {
+    return res.status(400).json({
+      success: false,
+      errorType: "INVALID_CUSTOMER_QR",
+      message: "PCB QR and Customer QR cannot be the same.",
+    });
+  }
+
+  // ============================================================
+  // 3. Production Order Validation
+  // ============================================================
+
+  const productionValidation =
+    await validateProductionOrderSequence(conn, {
+      factoryId: factory_id,
+      productId: product_id,
+      lineId: line_id,
+      stageId: stage_id,
+      scannedValue: pcbQr,
+    });
+
+  if (!productionValidation.ok) {
+    console.log(
+      "Customer binding production validation failed:",
+      productionValidation
+    );
+
+    return res.status(409).json({
+      success: false,
+      errorType: productionValidation.errorType,
+      message: productionValidation.message,
+      productionOrderId: productionValidation.productionOrderId ?? null,
+      expectedSequence: productionValidation.expectedSequence ?? null,
+      expectedSerial: productionValidation.expectedSerial ?? null,
+      scannedSequence: productionValidation.scannedSequence ?? null,
+      scannedSerial: productionValidation.scannedSerial ?? null,
+    });
+  }
+
+  const {
+    productionOrder,
+    productionOrderItem,
+    productionOrderStage,
+  } = productionValidation;
+
+  // ============================================================
+  // 4. Customer QR must not be another PCB serial
+  // ============================================================
+
+  const [customerAsPcbRows] = await conn.query(
+    `
+    SELECT id
+    FROM production_order_items
+    WHERE serial_no = ?
+    LIMIT 1
+    `,
+    [customerQr]
+  );
+
+  if (customerAsPcbRows.length) {
+    return res.status(400).json({
+      success: false,
+      errorType: "CUSTOMER_QR_IS_PCB",
+      message:
+        `"${customerQr}" is a PCB serial and cannot be used as a Customer QR.`,
+    });
+  }
+
+  // ============================================================
+  // 5. Check whether PCB is already bound
+  // ============================================================
+
+  const [existingBindingRows] = await conn.query(
+    `
+    SELECT
+      id,
+      pcb_qr,
+      customer_qr,
+      created_at
+    FROM customer_bindings
+    WHERE pcb_qr = ?
+    LIMIT 1
+    `,
+    [pcbQr]
+  );
+
+  if (existingBindingRows.length) {
+    const existing = existingBindingRows[0];
+
+    return res.status(409).json({
+      success: false,
+      errorType: "PCB_ALREADY_BOUND",
+      message: `"${pcbQr}" is already bound to a customer.`,
+      data: {
+        binding_id: existing.id,
+        pcb_qr: existing.pcb_qr,
+        customer_qr: existing.customer_qr,
+        created_at: existing.created_at,
+      },
+    });
+  }
+
+  // ============================================================
+  // 6. Create Binding + Scan History + Production State
+  // ============================================================
+
+  await conn.beginTransaction();
+
+  try {
+    // ==========================================================
+    // 6.1 Create Customer Binding
+    // ==========================================================
+
+    const [bindingResult] = await conn.query(
+      `
+      INSERT INTO customer_bindings
+      (
+        pcb_qr,
+        customer_qr,
+        product_id,
+        production_order_id,
+        factory_id,
+        line_id,
+        stage_id,
+        created_by
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        pcbQr,
+        customerQr,
+        productionOrder.product_id,
+        productionOrder.id,
+        factory_id,
+        line_id,
+        stage_id,
+        userId,
+      ]
+    );
+
+    const bindingId = bindingResult.insertId;
+
+    // ==========================================================
+    // 6.2 Record Scan History
+    // ==========================================================
+
+    const [historyResult] = await conn.query(
+      `
+      INSERT INTO scan_history
+      (
+        factory_id,
+        line_id,
+        stage_id,
+        user_id,
+        production_order_id,
+        scanned_value,
+        sequence_no,
+        status,
+        group_id
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'SUCCESS', NULL)
+      `,
+      [
+        factory_id,
+        line_id,
+        stage_id,
+        userId,
+        productionOrder.id,
+        pcbQr,
+        currentSeq,
+      ]
+    );
+
+    // ==========================================================
+    // 6.3 Update PCB Production State
+    // ==========================================================
+
+    await syncProduction(conn, {
+      scanned_value: pcbQr,
+      product_id,
+      factory_id,
+      line_id,
+      stage_id,
+      currentSeq,
+      lastSequence,
+    });
+
+    // ==========================================================
+    // 6.4 Production Achievement
+    // ==========================================================
+
+    const [achievementRows] = await conn.query(
+      `
+      SELECT
+        COUNT(DISTINCT sh.scanned_value) AS achieved_qty
+      FROM scan_history sh
+      WHERE sh.production_order_id = ?
+        AND sh.stage_id = ?
+        AND sh.status = 'SUCCESS'
+      `,
+      [
+        productionOrder.id,
+        stage_id,
+      ]
+    );
+
+    const stageAchievedQty = Number(
+      achievementRows[0]?.achieved_qty || 0
+    );
+
+    const targetQty = Number(
+      productionOrder.target_qty || 0
+    );
+
+    const remainingQty = Math.max(
+      targetQty - stageAchievedQty,
+      0
+    );
+
+    const achievementPercent =
+      targetQty > 0
+        ? Number(
+            ((stageAchievedQty / targetQty) * 100).toFixed(1)
+          )
+        : 0;
+
+    // ==========================================================
+    // 6.5 Complete Production Order When Target Is Reached
+    // ==========================================================
+
+    let productionCompleted = false;
+
+    if (
+      targetQty > 0 &&
+      stageAchievedQty >= targetQty
+    ) {
+      await conn.query(
+        `
+        UPDATE production_orders
+        SET
+          status = 'COMPLETED',
+          completed_at = NOW()
+        WHERE id = ?
+          AND status = 'RUNNING'
+        `,
+        [productionOrder.id]
+      );
+
+      productionCompleted = true;
+    }
+
+    // ==========================================================
+    // 6.6 Advance Production Order Stage
+    // ==========================================================
+
+    let productionStageCompleted = false;
+    let nextExpectedSequence = null;
+
+    if (
+      productionOrder.sequence_mode === "SEQUENTIAL" &&
+      productionOrderStage
+    ) {
+      const currentExpected = Number(
+        productionOrderStage.next_expected_sequence
+      );
+
+      const lastSequenceNumber = Number(
+        productionOrder.serial_end
+      );
+
+      nextExpectedSequence = currentExpected + 1;
+
+      if (currentExpected >= lastSequenceNumber) {
+        await conn.query(
+          `
+          UPDATE production_order_stages
+          SET
+            next_expected_sequence = ?,
+            status = 'COMPLETED'
+          WHERE id = ?
+          `,
+          [
+            nextExpectedSequence,
+            productionOrderStage.id,
+          ]
+        );
+
+        productionStageCompleted = true;
+
+      } else {
+        await conn.query(
+          `
+          UPDATE production_order_stages
+          SET
+            next_expected_sequence = ?
+          WHERE id = ?
+          `,
+          [
+            nextExpectedSequence,
+            productionOrderStage.id,
+          ]
+        );
+      }
+    }
+
+    // ==========================================================
+    // 7. Commit
+    // ==========================================================
+
+    await conn.commit();
+
+    // ==========================================================
+    // 8. Response
+    // ==========================================================
+
+    return res.status(201).json({
+      success: true,
+
+      message: productionCompleted
+        ? "Customer binding created successfully. Production order completed."
+        : "Customer binding created successfully.",
+
+      data: {
+        id: historyResult.insertId,
+
+        serial_no: pcbQr,
+        sequence_no: currentSeq,
+
+        scan_mode: "CUSTOMER_BINDING",
+        pending_group: false,
+
+        // Customer Binding
+        customer_binding_id: bindingId,
+
+        customer_qr: customerQr,
+
+        // Production Order
+        production_order_id: productionOrder.id,
+        production_sequence: productionOrderItem.sequence_no,
+        production_sequence_mode: productionOrder.sequence_mode,
+
+        // Production target
+        stage_target_qty: targetQty,
+
+        // Achievement
+        stage_achieved_qty: stageAchievedQty,
+        stage_remaining_qty: remainingQty,
+        stage_achievement_percent: achievementPercent,
+
+        // Production Order
+        production_completed: productionCompleted,
+
+        // Sequential stage
+        next_expected_sequence: nextExpectedSequence,
+        stage_completed: productionStageCompleted,
+      },
+    });
+
+  } catch (error) {
+    console.log("ERR IN CUSTOMER BINDING:", error);
+
+    await conn.rollback();
+
+    throw error;
+  }
+};
+
 export const submitScan = async (req, res) => {
   const conn = await pool.getConnection();
   try {
-    const { scanned_value, product_id } = req.body;
+    const { scanned_value, customer_qr, product_id } = req.body;
     const userId = req?.user?.id;
+
+    console.log("CUSTOMER BINDING REQUEST:", req.body);
 
     if (!scanned_value) {
       return res.status(400).json({ success: false, message: "Scanned code is required" });
@@ -1739,6 +2150,7 @@ export const submitScan = async (req, res) => {
       stage_id,
       userId,
       scanned_value,
+      customer_qr,
       product_id,
 
       currentSeq,
@@ -1786,12 +2198,21 @@ export const submitScan = async (req, res) => {
     switch (scan_mode) {
       case "SINGLE":
         return await handleSingleScan(conn, res, ctx);
+
       case "GROUP_CREATE":
         return await handleGroupCreate(conn, res, ctx);
+
       case "GROUP_SCAN":
         return await handleGroupScan(conn, res, ctx);
+
+      case "CUSTOMER_BINDING":
+        return await handleCustomerBinding(conn, res, ctx);
+
       default:
-        return res.status(400).json({ success: false, message: "Invalid scan mode" });
+        return res.status(400).json({
+          success: false,
+          message: "Invalid scan mode"
+        });
     }
 
   } catch (error) {
