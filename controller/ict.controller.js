@@ -34,15 +34,6 @@ export const saveICTResult = async (req, res) => {
             });
         }
 
-        console.log("====================================");
-        console.log("📥 External Result Received");
-        console.log({
-            serialNo,
-            program,
-            cleanResult,
-            machineName,
-            machineCode
-        });
 
         if(!serialNo || !cleanResult || !machineName || !machineCode) {
             const endTime = process.hrtime.bigint();
@@ -69,9 +60,7 @@ export const saveICTResult = async (req, res) => {
 
         const elapsedMs = Number(endTime - startTime) / 1_000_000;
 
-        console.log(`⚡ Server Processing Time: ${elapsedMs.toFixed(2)} ms`);
-        console.log("====================================");
-
+      
         return res.json({
             success: true,
             processingTime: `${elapsedMs.toFixed(2)} ms`,

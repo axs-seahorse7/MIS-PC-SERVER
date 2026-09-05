@@ -281,6 +281,7 @@ export const processPackagingScan = async (
             sap_code: product?.erp_no ?? null,
 
             print_job_id: printJobResult.insertId,
+            printer_id,
             printer_name,
 
             quantity: newQuantity,

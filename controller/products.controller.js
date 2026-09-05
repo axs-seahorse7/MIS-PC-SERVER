@@ -309,7 +309,6 @@ export const deleteProduct = async (req, res) => {
 
 export const getProducts = async (req, res) => {
   try {
-    console.log("REQ USER:", req.user);
     const [userRows] = await pool.query(
       `
       SELECT
@@ -335,7 +334,6 @@ export const getProducts = async (req, res) => {
       role: userRole,
     } = userRows[0];
 
-    console.log("USER CONTEXT:", userRows[0]);
 
     if (!factoryId) {
       return res.status(400).json({
@@ -451,6 +449,34 @@ export const getProducts = async (req, res) => {
   }
 };
 
+export const getConfigurableProducts = async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        erp_no,
+        part_code,
+        description
+      FROM products
+      WHERE is_active = 1
+      ORDER BY id DESC
+      `
+    );
+
+    return res.status(200).json({
+      message: "Configurable products fetched successfully",
+      data: rows,
+    });
+  } catch (error) {
+    console.error("ERR IN GET CONFIGURABLE PRODUCTS:", error);
+
+    return res.status(500).json({
+      message: error.message,
+    });
+  }
+};
 export const getProductsForAdmin = async (req, res) => {
   try {
     const [rows] = await pool.query(`

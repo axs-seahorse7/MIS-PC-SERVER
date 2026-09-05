@@ -35,6 +35,14 @@ import packegingConfigRoutes from "./routes/packegingConfig.routes.js";
 import printerRoutes from "./routes/printers.route.js";
 import printRoutes from "./routes/print.routes.js"
 import productionOrderRoutes from "./routes/productionOrder.routes.js";
+import customerSerialRuleRoutes from "./routes/Customerserialrule.routes.js";
+import labelTemplateRoutes from "./routes/labelTemplate.routes.js";
+
+import productPrintJobRoutes from "./routes/productPrintJob.routes.js";
+import productionSerialRuleRoutes from "./routes/productionSerialRule.routes.js";
+import productionQrRoutes from "./routes/productionQr.routes.js";
+
+
 
 
 const app = express();
@@ -42,12 +50,11 @@ const app = express();
 // ---------- DB ----------
 connectDB();
 
-app.use((req, res, next) => {
+// app.use((req, res, next) => {
   
-  console.log(`[${new Date().getHours()}:${new Date().getMinutes()}:${new Date().getSeconds()}] : [${req.method}] > ${req.url} [ORIGIN] >  ${req.headers.origin}`);
-  console.log(`Hii this is the request body: ${JSON.stringify(req.body)}`);
-  next();
-});
+//   console.log(`[${new Date().getHours()}:${new Date().getMinutes()}:${new Date().getSeconds()}] : [${req.method}] > ${req.url} [ORIGIN] >  ${req.headers.origin}`);
+//   next();
+// });
 
 // app.use((req, res, next) => {
 //     res.on("finish", () => {
@@ -58,6 +65,8 @@ app.use((req, res, next) => {
 
 // ---------- Core Middleware ----------
 app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+
 app.use(cookieParser());
 
 app.use(
@@ -119,6 +128,12 @@ app.use("/api/production-targets", productionTargetRoutes);
 app.use("/api/packaging-config", packegingConfigRoutes);
 app.use("/api/printers", printerRoutes);
 
+
+app.use("/api/customer-serial-rules", customerSerialRuleRoutes);
+app.use("/api/label-templates", labelTemplateRoutes);
+app.use("/api/product-print-jobs",productPrintJobRoutes);
+app.use("/api/production-serial-rules", productionSerialRuleRoutes);
+app.use("/api/production-qr", productionQrRoutes);
 
 
 // ---------- 404 ----------

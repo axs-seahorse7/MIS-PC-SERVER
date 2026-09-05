@@ -1,5 +1,10 @@
 import { pool } from "../DB/config/mysql.config.js";
 
+// ============================================================
+// PRODUCTION SERIAL RULE HELPERS
+// ============================================================
+
+
 export const createProductionOrder = async (req, res) => {
   const connection = await pool.getConnection();
 
@@ -8,10 +13,6 @@ export const createProductionOrder = async (req, res) => {
       productId,
       lineId,
       targetQty,
-      serialPrefix,
-      serialStart,
-      serialEnd,
-      serialWidth = 5,
       sequenceMode = "NON_SEQUENTIAL",
       plannedDate,
     } = req.body;
@@ -38,7 +39,7 @@ export const createProductionOrder = async (req, res) => {
     const factoryId = userRows[0].factory_id;
 
     // ============================================================
-    // VALIDATION
+    // BASIC VALIDATION
     // ============================================================
 
     if (!productId) {
@@ -59,36 +60,9 @@ export const createProductionOrder = async (req, res) => {
       });
     }
 
-    if (!serialPrefix?.trim()) {
+    if (!Number.isInteger(Number(targetQty))) {
       return res.status(400).json({
-        message: "Serial prefix is required",
-      });
-    }
-
-    if (
-      serialStart === undefined ||
-      serialStart === null ||
-      serialEnd === undefined ||
-      serialEnd === null
-    ) {
-      return res.status(400).json({
-        message: "Serial start and serial end are required",
-      });
-    }
-
-    if (Number(serialStart) > Number(serialEnd)) {
-      return res.status(400).json({
-        message: "Serial start cannot be greater than serial end",
-      });
-    }
-
-    const calculatedQty =Number(serialEnd) - Number(serialStart) + 1;
-
-    if (calculatedQty !== Number(targetQty)) {
-      return res.status(400).json({
-        message: "Target quantity must match the serial range",
-        calculatedQty,
-        targetQty: Number(targetQty),
+        message: "Target quantity must be a whole number",
       });
     }
 
@@ -98,11 +72,7 @@ export const createProductionOrder = async (req, res) => {
       });
     }
 
-    if (!serialWidth || Number(serialWidth) <= 0) {
-      return res.status(400).json({
-        message: "Valid serial width is required",
-      });
-    }
+    const quantity = Number(targetQty);
 
     // ============================================================
     // START TRANSACTION
@@ -124,11 +94,7 @@ export const createProductionOrder = async (req, res) => {
     );
 
     if (!factoryRows.length) {
-      await connection.rollback();
-
-      return res.status(404).json({
-        message: "Factory not found",
-      });
+      throw new Error("Factory not found");
     }
 
     // ============================================================
@@ -137,21 +103,24 @@ export const createProductionOrder = async (req, res) => {
 
     const [productRows] = await connection.query(
       `
-      SELECT id, name, erp_no
+      SELECT
+        id,
+        name,
+        part_code,
+        erp_no
       FROM products
       WHERE id = ?
         AND is_active = 1
+      LIMIT 1
       `,
       [productId]
     );
 
     if (!productRows.length) {
-      await connection.rollback();
-
-      return res.status(404).json({
-        message: "Product not found",
-      });
+      throw new Error("Product not found");
     }
+
+    const product = productRows[0];
 
     // ============================================================
     // VALIDATE PRODUCTION LINE
@@ -159,24 +128,25 @@ export const createProductionOrder = async (req, res) => {
 
     const [lineRows] = await connection.query(
       `
-      SELECT id, name, factory_id
+      SELECT
+        id,
+        name,
+        factory_id
       FROM production_lines
       WHERE id = ?
         AND factory_id = ?
+        AND is_active = 1
+      LIMIT 1
       `,
       [lineId, factoryId]
     );
 
     if (!lineRows.length) {
-      await connection.rollback();
-
-      return res.status(404).json({
-        message: "Production line not found in user's factory",
-      });
+      throw new Error("Production line not found in user's factory");
     }
 
     // ============================================================
-    // GET PRODUCT STAGE FLOW FOR THIS FACTORY
+    // GET PRODUCT STAGE FLOW
     // ============================================================
 
     const [stageFlowRows] = await connection.query(
@@ -185,22 +155,217 @@ export const createProductionOrder = async (req, res) => {
         psf.stage_id,
         psf.sequence_no
       FROM product_stage_flow psf
+
       INNER JOIN stages s
         ON s.id = psf.stage_id
+
       WHERE psf.product_id = ?
         AND s.factory_id = ?
         AND s.is_active = 1
+
       ORDER BY psf.sequence_no ASC
       `,
       [productId, factoryId]
     );
 
     if (!stageFlowRows.length) {
-      await connection.rollback();
+      throw new Error(
+        "No stage flow configured for this product in this factory"
+      );
+    }
 
-      return res.status(400).json({
-        message:"No stage flow configured for this product in this factory",
-      });
+    // ============================================================
+    // GET PRODUCT SERIAL RULE
+    //
+    // IMPORTANT:
+    // Product-level only.
+    // Production Order does NOT generate serials.
+    // ============================================================
+
+    const [serialRuleRows] = await connection.query(
+      `
+      SELECT
+        id,
+        product_id,
+        rule,
+        current_year,
+        current_week,
+        next_serial,
+        is_active
+      FROM production_serial_rules
+      WHERE product_id = ?
+        AND is_active = 1
+      LIMIT 1
+      `,
+      [productId]
+    );
+
+    if (!serialRuleRows.length) {
+      throw new Error(
+        "No active production serial rule configured for this product"
+      );
+    }
+
+    const serialRule = serialRuleRows[0];
+
+    // ============================================================
+    // PARSE RULE
+    // ============================================================
+
+    let rule;
+
+    try {
+      rule =
+        typeof serialRule.rule === "string"
+          ? JSON.parse(serialRule.rule)
+          : serialRule.rule;
+    } catch {
+      throw new Error(
+        "Production serial rule contains invalid JSON"
+      );
+    }
+
+    if (!Array.isArray(rule) || !rule.length) {
+      throw new Error("Production serial rule is invalid");
+    }
+
+    // ============================================================
+    // FIND SERIAL SEGMENT
+    // ============================================================
+
+    const serialSegments = rule.filter(
+      (segment) => segment?.type === "SERIAL"
+    );
+
+    if (serialSegments.length !== 1) {
+      throw new Error(
+        "Production serial rule must contain exactly one SERIAL segment"
+      );
+    }
+
+    const serialWidth = Number(serialSegments[0].width);
+
+    if (
+      !Number.isInteger(serialWidth) ||
+      serialWidth < 1 ||
+      serialWidth > 5
+    ) {
+      throw new Error(
+        "Production serial rule has an invalid SERIAL width"
+      );
+    }
+
+    // ============================================================
+    // FIND AVAILABLE QR IDENTITIES
+    //
+    // IMPORTANT:
+    // QR pool is PRODUCT-level.
+    //
+    // Production orders DO NOT consume the QR pool.
+    //
+    // The same QR identity may be assigned to different
+    // production lines.
+    // ============================================================
+
+    const [qrRows] = await connection.query(
+      `
+      SELECT
+        id,
+        bucket_id,
+        product_id,
+        serial_no,
+        qr_data,
+        status
+      FROM production_qr_codes
+      WHERE product_id = ?
+        AND status IN ('GENERATED', 'PRINTED')
+      ORDER BY id ASC
+      `,
+      [productId]
+    );
+
+    if (qrRows.length < quantity) {
+      throw new Error(
+        `Insufficient generated Product QR codes. Required: ${quantity}, available: ${qrRows.length}`
+      );
+    }
+
+    // ============================================================
+    // SELECT QR IDENTITIES NOT ALREADY ASSIGNED TO THIS LINE
+    //
+    // IMPORTANT:
+    //
+    // Same QR on different lines = ALLOWED
+    // Same QR on same line = NOT ALLOWED
+    // ============================================================
+
+    const candidateQrRows = [];
+
+    for (const qr of qrRows) {
+      const [existingRows] = await connection.query(
+        `
+        SELECT poi.id
+        FROM production_order_items poi
+
+        INNER JOIN production_orders po
+          ON po.id = poi.production_order_id
+
+        WHERE po.line_id = ?
+          AND po.product_id = ?
+          AND poi.serial_no = ?
+
+        LIMIT 1
+        `,
+        [lineId, productId, qr.qr_data]
+      );
+
+      if (!existingRows.length) {
+        candidateQrRows.push(qr);
+      }
+
+      if (candidateQrRows.length >= quantity) {
+        break;
+      }
+    }
+
+    if (candidateQrRows.length < quantity) {
+      throw new Error(
+        `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
+      );
+    }
+
+    // ============================================================
+    // LOCK SELECTED QR IDENTITIES
+    //
+    // Re-check after locking to prevent concurrent assignment.
+    // ============================================================
+
+    const qrIds = candidateQrRows.map((row) => row.id);
+    const placeholders = qrIds.map(() => "?").join(",");
+
+    const [lockedQrRows] = await connection.query(
+      `
+      SELECT
+        id,
+        bucket_id,
+        product_id,
+        serial_no,
+        qr_data,
+        status
+      FROM production_qr_codes
+      WHERE id IN (${placeholders})
+        AND product_id = ?
+        AND status IN ('GENERATED', 'PRINTED')
+      ORDER BY id ASC
+      FOR UPDATE
+      `,
+      [...qrIds, productId]
+    );
+
+    if (lockedQrRows.length < quantity) {
+      throw new Error(
+        "Some selected Product QR codes are no longer available"
+      );
     }
 
     // ============================================================
@@ -214,6 +379,7 @@ export const createProductionOrder = async (req, res) => {
     const day = String(today.getDate()).padStart(2, "0");
 
     const datePrefix = `PO${year}${month}${day}`;
+
     const [orderRows] = await connection.query(
       `
       SELECT order_no
@@ -228,18 +394,35 @@ export const createProductionOrder = async (req, res) => {
 
     let orderNumber = 1;
 
-    if (orderRows.length > 0) {
-      const lastOrderNo = orderRows[0].order_no;
+    if (orderRows.length) {
+      const lastOrderNo = String(orderRows[0].order_no || "");
 
-      const lastNumber = parseInt(
-        lastOrderNo.split("-").pop(),
-        10
-      );
+      const suffix = lastOrderNo.slice(datePrefix.length);
+      const lastNumber = parseInt(suffix, 10);
 
-      orderNumber = lastNumber + 1;
+      if (Number.isInteger(lastNumber)) {
+        orderNumber = lastNumber + 1;
+      }
     }
 
-    const orderNo =`${datePrefix}${String(orderNumber).padStart(3, "0")}`;
+    const orderNo = `${datePrefix}${String(orderNumber).padStart(3, "0")}`;
+    
+    // ============================================================
+    // LEGACY SERIAL SNAPSHOT
+    //
+    // Keep these fields because the current production_orders
+    // schema still contains them.
+    //
+    // IMPORTANT:
+    // They are NOT used to generate or control QR identities.
+    // ============================================================
+
+    const firstQr = lockedQrRows[0];
+
+    const serialStart = 1;
+    const serialEnd = quantity;
+
+    const serialPrefix = firstQr.qr_data?.slice(0, Math.max(0, firstQr.qr_data.length - serialWidth)) || "";
 
     // ============================================================
     // CREATE PRODUCTION ORDER
@@ -269,8 +452,8 @@ export const createProductionOrder = async (req, res) => {
         factoryId,
         productId,
         lineId,
-        targetQty,
-        serialPrefix.trim(),
+        quantity,
+        serialPrefix,
         serialStart,
         serialEnd,
         serialWidth,
@@ -284,32 +467,22 @@ export const createProductionOrder = async (req, res) => {
 
     // ============================================================
     // CREATE PRODUCTION ORDER ITEMS
+    //
+    // Complete physical QR identity is stored.
+    //
+    // sequence_no is LOCAL to this production order.
     // ============================================================
 
-    const itemValues = [];
-
-    for (
-      let sequence = Number(serialStart);
-      sequence <= Number(serialEnd);
-      sequence++
-    ) {
-      const serialSequence = String(sequence).padStart(
-        Number(serialWidth),
-        "0"
-      );
-
-      const serialNo =
-        `${serialPrefix.trim()}${serialSequence}`;
-
-      itemValues.push([
+    const itemValues = lockedQrRows
+      .slice(0, quantity)
+      .map((qr, index) => [
         productionOrderId,
-        serialNo,
-        sequence,
+        qr.qr_data,
+        index + 1,
         "ACTIVE",
       ]);
-    }
 
-    if (itemValues.length > 0) {
+    if (itemValues.length) {
       await connection.query(
         `
         INSERT INTO production_order_items (
@@ -332,7 +505,7 @@ export const createProductionOrder = async (req, res) => {
       productionOrderId,
       stage.stage_id,
       stage.sequence_no,
-      serialStart,
+      1,
       "PENDING",
     ]);
 
@@ -356,6 +529,10 @@ export const createProductionOrder = async (req, res) => {
 
     await connection.commit();
 
+    // ============================================================
+    // RESPONSE
+    // ============================================================
+
     return res.status(201).json({
       message: "Production order created successfully",
 
@@ -367,24 +544,33 @@ export const createProductionOrder = async (req, res) => {
         factoryName: factoryRows[0].name,
 
         productId,
+        productName: product.name,
 
         lineId,
         lineName: lineRows[0].name,
 
-        targetQty: Number(targetQty),
+        targetQty: quantity,
 
-        serialPrefix: serialPrefix.trim(),
-        serialStart: Number(serialStart),
-        serialEnd: Number(serialEnd),
-        serialWidth: Number(serialWidth),
+        // Legacy snapshot fields
+        serialPrefix,
+        serialStart,
+        serialEnd,
+        serialWidth,
+
+        serialRuleId: serialRule.id,
+
+        qrRange: {
+          from: lockedQrRows[0].qr_data,
+          to: lockedQrRows[quantity - 1].qr_data,
+        },
 
         sequenceMode,
+
         status: "PLANNED",
 
         stageCount: stageFlowRows.length,
       },
     });
-
   } catch (error) {
     await connection.rollback();
 
@@ -395,14 +581,14 @@ export const createProductionOrder = async (req, res) => {
 
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
-        message: "Production order already exists",
+        message:
+          "Production order or serial number already exists",
       });
     }
 
     return res.status(500).json({
       message: error.message,
     });
-
   } finally {
     connection.release();
   }
@@ -418,16 +604,12 @@ export const updateProductionOrder = async (req, res) => {
       productId,
       lineId,
       targetQty,
-      serialPrefix,
-      serialStart,
-      serialEnd,
-      serialWidth = 5,
       sequenceMode = "NON_SEQUENTIAL",
       plannedDate,
     } = req.body;
 
     // ============================================================
-    // Validation (same rules as create)
+    // BASIC VALIDATION
     // ============================================================
 
     if (!productId) {
@@ -438,35 +620,12 @@ export const updateProductionOrder = async (req, res) => {
       return res.status(400).json({ message: "Production line is required" });
     }
 
-    if (!targetQty || targetQty <= 0) {
+    if (!targetQty || Number(targetQty) <= 0) {
       return res.status(400).json({ message: "Valid target quantity is required" });
     }
 
-    if (!serialPrefix?.trim()) {
-      return res.status(400).json({ message: "Serial prefix is required" });
-    }
-
-    if (
-      serialStart === undefined ||
-      serialStart === null ||
-      serialEnd === undefined ||
-      serialEnd === null
-    ) {
-      return res.status(400).json({ message: "Serial start and serial end are required" });
-    }
-
-    if (serialStart > serialEnd) {
-      return res.status(400).json({ message: "Serial start cannot be greater than serial end" });
-    }
-
-    const calculatedQty = serialEnd - serialStart + 1;
-
-    if (calculatedQty !== Number(targetQty)) {
-      return res.status(400).json({
-        message: "Target quantity must match the serial range",
-        calculatedQty,
-        targetQty: Number(targetQty),
-      });
+    if (!Number.isInteger(Number(targetQty))) {
+      return res.status(400).json({ message: "Target quantity must be a whole number" });
     }
 
     if (!["SEQUENTIAL", "NON_SEQUENTIAL"].includes(sequenceMode)) {
@@ -475,58 +634,12 @@ export const updateProductionOrder = async (req, res) => {
       });
     }
 
-    if (!serialWidth || serialWidth <= 0) {
-      return res.status(400).json({ message: "Valid serial width is required" });
-    }
-
-    await connection.beginTransaction();
+    const quantity = Number(targetQty);
 
     // ============================================================
-    // Lock and validate the existing order
+    // GET USER FACTORY
     // ============================================================
 
-    const [existingRows] = await connection.query(
-      `
-      SELECT id, status
-      FROM production_orders
-      WHERE id = ?
-      FOR UPDATE
-      `,
-      [id]
-    );
-
-    if (existingRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ message: "Production order not found" });
-    }
-
-    if (existingRows[0].status !== "PLANNED") {
-      await connection.rollback();
-      return res.status(400).json({
-        message: `Order cannot be edited because it is already ${existingRows[0].status.toLowerCase()}`,
-      });
-    }
-
-    // ============================================================
-    // Validate Product
-    // ============================================================
-
-    const [productRows] = await connection.query(
-      `
-      SELECT id
-      FROM products
-      WHERE id = ?
-        AND is_active = 1
-      `,
-      [productId]
-    );
-
-    if (productRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ message: "Product not found" });
-    }
-
-    // Get user's factory
     const [userRows] = await connection.query(
       `
       SELECT factory_id
@@ -537,8 +650,6 @@ export const updateProductionOrder = async (req, res) => {
     );
 
     if (!userRows.length || !userRows[0].factory_id) {
-      await connection.rollback();
-
       return res.status(400).json({
         message: "User is not assigned to a factory",
       });
@@ -547,26 +658,91 @@ export const updateProductionOrder = async (req, res) => {
     const factoryId = userRows[0].factory_id;
 
     // ============================================================
-    // Validate Production Line
+    // START TRANSACTION
+    // ============================================================
+
+    await connection.beginTransaction();
+
+    // ============================================================
+    // LOCK EXISTING ORDER
+    // ============================================================
+
+    const [existingRows] = await connection.query(
+      `
+      SELECT
+        id,
+        status,
+        product_id AS old_product_id,
+        line_id AS old_line_id
+      FROM production_orders
+      WHERE id = ?
+      FOR UPDATE
+      `,
+      [id]
+    );
+
+    if (!existingRows.length) {
+      throw new Error("Production order not found");
+    }
+
+    const existingOrder = existingRows[0];
+
+    if (existingOrder.status !== "PLANNED") {
+      throw new Error(
+        `Order cannot be edited because it is already ${existingOrder.status.toLowerCase()}`
+      );
+    }
+
+    // ============================================================
+    // VALIDATE PRODUCT
+    // ============================================================
+
+    const [productRows] = await connection.query(
+      `
+      SELECT
+        id,
+        name,
+        part_code,
+        erp_no
+      FROM products
+      WHERE id = ?
+        AND is_active = 1
+      LIMIT 1
+      `,
+      [productId]
+    );
+
+    if (!productRows.length) {
+      throw new Error("Product not found");
+    }
+
+    const product = productRows[0];
+
+    // ============================================================
+    // VALIDATE PRODUCTION LINE
     // ============================================================
 
     const [lineRows] = await connection.query(
       `
-      SELECT id
+      SELECT
+        id,
+        name,
+        factory_id
       FROM production_lines
       WHERE id = ?
-      AND factory_id = ?
+        AND factory_id = ?
+        AND is_active = 1
+      LIMIT 1
       `,
       [lineId, factoryId]
     );
 
-    if (lineRows.length === 0) {
-      await connection.rollback();
-      return res.status(404).json({ message: "Production line not found" });
+    if (!lineRows.length) {
+      throw new Error("Production line not found in user's factory");
     }
 
     // ============================================================
-    // Get Product Stage Flow (product may have changed)
+    // GET PRODUCT STAGE FLOW
     // ============================================================
 
     const [stageFlowRows] = await connection.query(
@@ -575,23 +751,231 @@ export const updateProductionOrder = async (req, res) => {
         psf.stage_id,
         psf.sequence_no
       FROM product_stage_flow psf
+
       INNER JOIN stages s
         ON s.id = psf.stage_id
+
       WHERE psf.product_id = ?
         AND s.factory_id = ?
         AND s.is_active = 1
+
       ORDER BY psf.sequence_no ASC
       `,
       [productId, factoryId]
     );
 
-    if (stageFlowRows.length === 0) {
-      await connection.rollback();
-      return res.status(400).json({ message: "No stage flow configured for this product" });
+    if (!stageFlowRows.length) {
+      throw new Error(
+        "No stage flow configured for this product in this factory"
+      );
     }
 
     // ============================================================
-    // Update Production Order row
+    // GET PRODUCT SERIAL RULE
+    //
+    // Product-level rule only.
+    // Update does NOT modify the rule/counter.
+    // ============================================================
+
+    const [serialRuleRows] = await connection.query(
+      `
+      SELECT
+        id,
+        product_id,
+        rule,
+        current_year,
+        current_week,
+        next_serial,
+        is_active
+      FROM production_serial_rules
+      WHERE product_id = ?
+        AND is_active = 1
+      LIMIT 1
+      `,
+      [productId]
+    );
+
+    if (!serialRuleRows.length) {
+      throw new Error(
+        "No active production serial rule configured for this product"
+      );
+    }
+
+    const serialRule = serialRuleRows[0];
+
+    // ============================================================
+    // PARSE SERIAL RULE
+    // ============================================================
+
+    let rule;
+
+    try {
+      rule =
+        typeof serialRule.rule === "string"
+          ? JSON.parse(serialRule.rule)
+          : serialRule.rule;
+    } catch {
+      throw new Error("Production serial rule contains invalid JSON");
+    }
+
+    if (!Array.isArray(rule) || !rule.length) {
+      throw new Error("Production serial rule is invalid");
+    }
+
+    // ============================================================
+    // GET SERIAL WIDTH
+    // ============================================================
+
+    const serialSegments = rule.filter(
+      (segment) => segment?.type === "SERIAL"
+    );
+
+    if (serialSegments.length !== 1) {
+      throw new Error(
+        "Production serial rule must contain exactly one SERIAL segment"
+      );
+    }
+
+    const serialWidth = Number(serialSegments[0].width);
+
+    if (
+      !Number.isInteger(serialWidth) ||
+      serialWidth < 1 ||
+      serialWidth > 5
+    ) {
+      throw new Error(
+        "Production serial rule has an invalid SERIAL width"
+      );
+    }
+
+    // ============================================================
+    // GET AVAILABLE PRODUCT QR IDENTITIES
+    // ============================================================
+
+    const [qrRows] = await connection.query(
+      `
+      SELECT
+        id,
+        bucket_id,
+        product_id,
+        serial_no,
+        qr_data,
+        status
+      FROM production_qr_codes
+      WHERE product_id = ?
+        AND status IN ('GENERATED', 'PRINTED')
+      ORDER BY id ASC
+      `,
+      [productId]
+    );
+
+    if (qrRows.length < quantity) {
+      throw new Error(
+        `Insufficient generated Product QR codes. Required: ${quantity}, available: ${qrRows.length}`
+      );
+    }
+
+    // ============================================================
+    // SELECT QR IDENTITIES NOT ALREADY ASSIGNED TO THIS LINE
+    //
+    // IMPORTANT:
+    // Same QR on another line = ALLOWED.
+    // Same QR on this line = NOT ALLOWED.
+    //
+    // Exclude the CURRENT order because its items will be replaced.
+    // ============================================================
+
+    const candidateQrRows = [];
+
+    for (const qr of qrRows) {
+      const [existingItemRows] = await connection.query(
+        `
+        SELECT poi.id
+        FROM production_order_items poi
+
+        INNER JOIN production_orders po
+          ON po.id = poi.production_order_id
+
+        WHERE po.line_id = ?
+          AND po.product_id = ?
+          AND po.id <> ?
+          AND poi.serial_no = ?
+
+        LIMIT 1
+        `,
+        [lineId, productId, id, qr.qr_data]
+      );
+
+      if (!existingItemRows.length) {
+        candidateQrRows.push(qr);
+      }
+
+      if (candidateQrRows.length >= quantity) {
+        break;
+      }
+    }
+
+    if (candidateQrRows.length < quantity) {
+      throw new Error(
+        `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
+      );
+    }
+
+    // ============================================================
+    // LOCK SELECTED QR IDENTITIES
+    // ============================================================
+
+    const qrIds = candidateQrRows.map((row) => row.id);
+    const placeholders = qrIds.map(() => "?").join(",");
+
+    const [lockedQrRows] = await connection.query(
+      `
+      SELECT
+        id,
+        bucket_id,
+        product_id,
+        serial_no,
+        qr_data,
+        status
+      FROM production_qr_codes
+      WHERE id IN (${placeholders})
+        AND product_id = ?
+        AND status IN ('GENERATED', 'PRINTED')
+      ORDER BY id ASC
+      FOR UPDATE
+      `,
+      [...qrIds, productId]
+    );
+
+    if (lockedQrRows.length < quantity) {
+      throw new Error(
+        "Some selected Product QR codes are no longer available"
+      );
+    }
+
+    // ============================================================
+    // LEGACY SERIAL SNAPSHOT
+    //
+    // These fields remain only because the existing
+    // production_orders table still contains them.
+    //
+    // They are NOT used for QR generation.
+    // ============================================================
+
+    const firstQr = lockedQrRows[0];
+    const lastQr = lockedQrRows[quantity - 1];
+
+    const serialStart = firstQr.serial_no;
+    const serialEnd = lastQr.serial_no;
+
+    const serialPrefix =
+      firstQr.qr_data?.slice(
+        0,
+        Math.max(0, firstQr.qr_data.length - serialWidth)
+      ) || "";
+
+    // ============================================================
+    // UPDATE PRODUCTION ORDER
     // ============================================================
 
     await connection.query(
@@ -612,8 +996,8 @@ export const updateProductionOrder = async (req, res) => {
       [
         productId,
         lineId,
-        targetQty,
-        serialPrefix.trim(),
+        quantity,
+        serialPrefix,
         serialStart,
         serialEnd,
         serialWidth,
@@ -624,29 +1008,41 @@ export const updateProductionOrder = async (req, res) => {
     );
 
     // ============================================================
-    // Wipe and regenerate items + stages
+    // REMOVE OLD ITEMS + STAGES
     // ============================================================
 
     await connection.query(
-      `DELETE FROM production_order_items WHERE production_order_id = ?`,
+      `
+      DELETE FROM production_order_items
+      WHERE production_order_id = ?
+      `,
       [id]
     );
 
     await connection.query(
-      `DELETE FROM production_order_stages WHERE production_order_id = ?`,
+      `
+      DELETE FROM production_order_stages
+      WHERE production_order_id = ?
+      `,
       [id]
     );
 
-    const itemValues = [];
+    // ============================================================
+    // CREATE NEW ORDER ITEMS
+    //
+    // sequence_no is LOCAL to this production order.
+    // ============================================================
 
-    for (let sequence = Number(serialStart); sequence <= Number(serialEnd); sequence++) {
-      const serialSequence = String(sequence).padStart(Number(serialWidth), "0");
-      const serialNo = `${serialPrefix.trim()}${serialSequence}`;
+    const itemValues = lockedQrRows
+      .slice(0, quantity)
+      .map((qr, index) => [
+        id,
+        qr.qr_data,
+        index + 1,
+        "ACTIVE",
+      ]);
 
-      itemValues.push([id, serialNo, sequence, "ACTIVE"]);
-    }
-
-    if (itemValues.length > 0) {
+    if (itemValues.length) {
       await connection.query(
         `
         INSERT INTO production_order_items (
@@ -661,11 +1057,17 @@ export const updateProductionOrder = async (req, res) => {
       );
     }
 
+    // ============================================================
+    // CREATE NEW ORDER STAGES
+    //
+    // Always start from sequence 1 for a new PLANNED order.
+    // ============================================================
+
     const stageValues = stageFlowRows.map((stage) => [
       id,
       stage.stage_id,
       stage.sequence_no,
-      serialStart,
+      1,
       "PENDING",
     ]);
 
@@ -683,21 +1085,47 @@ export const updateProductionOrder = async (req, res) => {
       [stageValues]
     );
 
+    // ============================================================
+    // COMMIT
+    // ============================================================
+
     await connection.commit();
+
+    // ============================================================
+    // RESPONSE
+    // ============================================================
 
     return res.status(200).json({
       message: "Production order updated successfully",
+
       data: {
         id: Number(id),
+
         productId,
+        productName: product.name,
+
         lineId,
-        targetQty: Number(targetQty),
-        serialPrefix: serialPrefix.trim(),
-        serialStart: Number(serialStart),
-        serialEnd: Number(serialEnd),
-        serialWidth: Number(serialWidth),
+        lineName: lineRows[0].name,
+
+        targetQty: quantity,
+
+        // Legacy snapshot fields
+        serialPrefix,
+        serialStart,
+        serialEnd,
+        serialWidth,
+
+        serialRuleId: serialRule.id,
+
+        qrRange: {
+          from: firstQr.serial_no,
+          to: lastQr.serial_no,
+        },
+
         sequenceMode,
+
         status: "PLANNED",
+
         stageCount: stageFlowRows.length,
       },
     });
@@ -707,10 +1135,14 @@ export const updateProductionOrder = async (req, res) => {
     console.error("ERR IN UPDATE PRODUCTION ORDER:", error);
 
     if (error.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({ message: "Production order already exists" });
+      return res.status(409).json({
+        message: "Production order or serial number already exists",
+      });
     }
 
-    return res.status(500).json({ message: error.message });
+    return res.status(500).json({
+      message: error.message,
+    });
   } finally {
     connection.release();
   }
@@ -797,6 +1229,7 @@ export const startProductionOrder = async (req, res) => {
         product_id,
         line_id,
         status,
+        target_qty,
         serial_start,
         serial_end
       FROM production_orders
@@ -827,16 +1260,16 @@ export const startProductionOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         errorType: "INVALID_PRODUCTION_ORDER_STATUS",
-        message: `Production order cannot be started because it is already ${order.status.toLowerCase()}.`,
+        message:
+          `Production order cannot be started because it is already ${order.status.toLowerCase()}.`,
       });
     }
 
     // ============================================================
     // 3. Prevent Multiple RUNNING Orders
     //    Same Factory + Same Product + Same Line
-    //    (the same product CAN run simultaneously on different
-    //    lines within the same factory — only the same line is
-    //    restricted to one active order at a time)
+    //
+    //    Same product CAN run simultaneously on different lines.
     // ============================================================
 
     const [runningOrderRows] = await connection.query(
@@ -871,12 +1304,10 @@ export const startProductionOrder = async (req, res) => {
       return res.status(409).json({
         success: false,
         errorType: "PRODUCT_ALREADY_RUNNING_ON_LINE",
-
         message:
           `This product already has a running production order on this line ` +
           `(${runningOrder.order_no}). ` +
           `Please complete or cancel the existing production order before starting this one.`,
-
         runningProductionOrderId: runningOrder.id,
         runningProductionOrderNo: runningOrder.order_no,
         runningTargetQty: runningOrder.target_qty,
@@ -904,13 +1335,70 @@ export const startProductionOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         errorType: "NO_PRODUCTION_ORDER_ITEMS",
-        message:
-          "Production order has no generated serial items.",
+        message: "Production order has no generated serial items.",
       });
     }
 
     // ============================================================
-    // 5. Check Production Order Stages
+    // 5. Master Label Configuration
+    //
+    // Only calculate how many Master Labels this PO requires.
+    //
+    // No serial-capacity check.
+    // No current_serial check.
+    // No PRINTED check.
+    // No QR-pool check.
+    // ============================================================
+
+    const [packagingRows] = await connection.query(
+      `
+      SELECT
+        id,
+        box_size,
+        printer_id,
+        barcode_format,
+        label_template_id
+      FROM packaging_config
+      WHERE product_id = ?
+        AND is_active = 1
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [order.product_id]
+    );
+
+    if (!packagingRows.length) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        success: false,
+        errorType: "MASTER_LABEL_CONFIG_REQUIRED",
+        message:
+          "Active Master Label packaging configuration is required for this product.",
+      });
+    }
+
+    const packagingConfig = packagingRows[0];
+
+    const boxSize = Number(packagingConfig.box_size);
+    const targetQty = Number(order.target_qty || 0);
+
+    if (boxSize <= 0) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        success: false,
+        errorType: "INVALID_MASTER_LABEL_BOX_SIZE",
+        message: "Master Label box size must be greater than zero.",
+      });
+    }
+
+    const requiredMasterLabels = Math.ceil(
+      targetQty / boxSize
+    );
+
+    // ============================================================
+    // 6. Check Production Order Stages
     // ============================================================
 
     const [stageRows] = await connection.query(
@@ -934,31 +1422,30 @@ export const startProductionOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         errorType: "NO_PRODUCTION_ORDER_STAGES",
-        message:
-          "Production order has no configured stages.",
+        message: "Production order has no configured stages.",
       });
     }
 
     // ============================================================
-    // 6. Initialize Stage Sequence
+    // 7. Initialize Stage Sequence
+    //
+    // Product QR sequence is local to the Production Order:
+    // 1 → 2 → 3 → ... → targetQty
     // ============================================================
 
     await connection.query(
       `
       UPDATE production_order_stages
       SET
-        next_expected_sequence = ?,
+        next_expected_sequence = 1,
         status = 'RUNNING'
       WHERE production_order_id = ?
       `,
-      [
-        order.serial_start,
-        id,
-      ]
+      [id]
     );
 
     // ============================================================
-    // 7. Start Production Order
+    // 8. Start Production Order
     // ============================================================
 
     await connection.query(
@@ -973,13 +1460,13 @@ export const startProductionOrder = async (req, res) => {
     );
 
     // ============================================================
-    // 8. Commit
+    // 9. Commit
     // ============================================================
 
     await connection.commit();
 
     // ============================================================
-    // 9. Response
+    // 10. Response
     // ============================================================
 
     return res.status(200).json({
@@ -998,13 +1485,19 @@ export const startProductionOrder = async (req, res) => {
 
         startedAt: new Date(),
 
-        firstExpectedSequence:
-          order.serial_start,
+        firstExpectedSequence: 1,
 
-        stageCount:
-          stageRows.length,
-
+        stageCount: stageRows.length,
         itemCount,
+
+        // Master Label
+        masterLabel: {
+          boxSize,
+          requiredLabels: requiredMasterLabels,
+          packagingConfigId: packagingConfig.id,
+          printerId: packagingConfig.printer_id,
+          labelTemplateId: packagingConfig.label_template_id,
+        },
       },
     });
 
@@ -1237,6 +1730,26 @@ export const getProductionOrderById = async (req, res) => {
       return res.status(404).json({ message: "Production order not found" });
     }
 
+    const [itemRows] = await pool.query(
+      `
+        SELECT
+          id,
+          production_order_id,
+          serial_no,
+          customer_qr_code,
+          sequence_no,
+          status,
+          rejected_at,
+          rejected_by,
+          created_at,
+          updated_at
+        FROM production_order_items
+        WHERE production_order_id = ?
+        ORDER BY sequence_no ASC, id ASC
+      `,
+      [id]
+    );
+
     const [stageRows] = await pool.query(
       `
       SELECT
@@ -1256,7 +1769,11 @@ export const getProductionOrderById = async (req, res) => {
 
     return res.status(200).json({
       message: "Production order fetched successfully",
-      data: { ...orderRows[0], stages: stageRows },
+      data: {
+        ...orderRows[0],
+        items: itemRows,
+        stages: stageRows,
+      },
     });
   } catch (error) {
     console.error("ERR IN GET PRODUCTION ORDER BY ID:", error);

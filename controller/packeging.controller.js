@@ -4,17 +4,23 @@ import { asyncHandler, AppError } from "../utils/AppError.js";
 const BARCODE_FORMATS = ["CODE128", "QR", "EAN13", "DATAMATRIX"];
 
 // GET /api/packaging-config
+// GET /api/packaging-config
 export const getAllPackagingConfigs = asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT pc.*, 
             p.name AS product_name,
             s.name AS stage_name,
-            pr.printer_name AS printer_name
+            pr.printer_name AS printer_name,
+            lt.name AS label_template_name,
+            lt.width AS label_template_width,
+            lt.height AS label_template_height,
+            lt.dpi AS label_template_dpi
      FROM packaging_config pc
      LEFT JOIN products p ON p.id = pc.product_id
      LEFT JOIN product_stage_flow psf ON psf.id = pc.stage_id
      LEFT JOIN stages s ON s.id = psf.stage_id
      LEFT JOIN printers pr ON pr.id = pc.printer_id
+     LEFT JOIN label_templates lt ON lt.id = pc.label_template_id
      ORDER BY pc.updated_at DESC`
   );
 
@@ -116,6 +122,7 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
     printer_id,
     barcode_format,
     barcode_rule,
+    label_template_id,
     is_active,
   } = req.body;
 
@@ -124,10 +131,11 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
     !stage_id ||
     !box_size ||
     !printer_id ||
-    !barcode_format
+    !barcode_format ||
+    !label_template_id
   ) {
     throw new AppError(
-      "product_id, stage_id, box_size, printer_id and barcode_format are required",
+      "product_id, stage_id, box_size, printer_id, barcode_format and label_template_id are required",
       400
     );
   }
@@ -140,11 +148,12 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
   }
 
   const ruleError = validateBarcodeRule(barcode_rule);
+
   if (ruleError) {
     throw new AppError(ruleError, 400);
   }
 
-  // Validate that the selected stage is actually PACKAGING
+  // Validate selected station/stage
   const [stageRows] = await pool.query(
     `
     SELECT id, name
@@ -159,9 +168,26 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
     throw new AppError("Invalid stage", 400);
   }
 
-  if (stageRows[0].name !== "PACKAGING") {
+  // Validate Master Label template
+  const [templateRows] = await pool.query(
+    `
+    SELECT
+      id,
+      name,
+      template_type,
+      is_active
+    FROM label_templates
+    WHERE id = ?
+      AND template_type = 'BOX_LABEL'
+      AND is_active = 1
+    LIMIT 1
+    `,
+    [label_template_id]
+  );
+
+  if (!templateRows.length) {
     throw new AppError(
-      `Selected stage is "${stageRows[0].name}", not PACKAGING`,
+      "Invalid or inactive Master Label template",
       400
     );
   }
@@ -184,9 +210,11 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
     );
   }
 
-  // Counter starts at the SERIAL segment's configured `start` value so the
-  // first generated barcode matches exactly what the preview showed.
-  const serialSegment = barcode_rule.find((s) => s.type === "SERIAL");
+  // Counter starts at the SERIAL segment's configured `start` value
+  const serialSegment = barcode_rule.find(
+    (s) => s.type === "SERIAL"
+  );
+
   const initialSerial = Number(serialSegment.start);
 
   const [result] = await pool.query(
@@ -199,12 +227,13 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
         printer_id,
         barcode_format,
         barcode_rule,
+        label_template_id,
         current_serial,
         is_active,
         created_at,
         updated_at
       )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
     `,
     [
       product_id,
@@ -213,6 +242,7 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
       printer_id,
       barcode_format,
       JSON.stringify(barcode_rule),
+      label_template_id,
       initialSerial,
       is_active ?? true,
     ]
@@ -229,11 +259,27 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
 // PUT /api/packaging-config/:id
 export const updatePackagingConfig = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { product_id, stage_id, box_size, printer_id, barcode_format, barcode_rule, is_active } = req.body;
+  const {
+    product_id,
+    stage_id,
+    box_size,
+    printer_id,
+    barcode_format,
+    barcode_rule,
+    label_template_id,
+    is_active,
+  } = req.body;
 
-  if (!product_id || !stage_id || !box_size || !printer_id || !barcode_format) {
+  if (
+    !product_id ||
+    !stage_id ||
+    !box_size ||
+    !printer_id ||
+    !barcode_format ||
+    !label_template_id
+  ) {
     throw new AppError(
-      "product_id, stage_id, box_size, printer_id and barcode_format are required",
+      "product_id, stage_id, box_size, printer_id, barcode_format and label_template_id are required",
       400
     );
   }
@@ -250,6 +296,24 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
   const [existing] = await pool.query(`SELECT id, barcode_rule FROM packaging_config WHERE id = ?`, [id]);
   if (!existing.length) {
     throw new AppError("Packaging rule not found", 404);
+  }
+
+  // Validate Master Label template — same rule as create: must exist,
+  // be active, and be a BOX_LABEL type (this endpoint only ever deals with box labels).
+  const [templateRows] = await pool.query(
+    `
+    SELECT id
+    FROM label_templates
+    WHERE id = ?
+      AND template_type = 'BOX_LABEL'
+      AND is_active = 1
+    LIMIT 1
+    `,
+    [label_template_id]
+  );
+
+  if (!templateRows.length) {
+    throw new AppError("Invalid or inactive Master Label template", 400);
   }
 
   // guard against duplicate rule for same product + stage (excluding self)
@@ -275,6 +339,7 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
     "printer_id = ?",
     "barcode_format = ?",
     "barcode_rule = ?",
+    "label_template_id = ?",
     "is_active = ?",
   ];
   const values = [
@@ -284,6 +349,7 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
     printer_id,
     barcode_format,
     JSON.stringify(barcode_rule),
+    label_template_id,
     is_active ?? true,
   ];
 
@@ -314,6 +380,7 @@ export const patchPackagingConfig = asyncHandler(async (req, res) => {
     "printer_id",
     "barcode_format",
     "barcode_rule",
+    "label_template_id",
     "is_active",
   ];
 
@@ -334,6 +401,25 @@ export const patchPackagingConfig = asyncHandler(async (req, res) => {
     const ruleError = validateBarcodeRule(barcodeRuleUpdate[1]);
     if (ruleError) {
       throw new AppError(ruleError, 400);
+    }
+  }
+
+  const labelTemplateUpdate = updates.find(([key]) => key === "label_template_id");
+  if (labelTemplateUpdate) {
+    const [templateRows] = await pool.query(
+      `
+      SELECT id
+      FROM label_templates
+      WHERE id = ?
+        AND template_type = 'BOX_LABEL'
+        AND is_active = 1
+      LIMIT 1
+      `,
+      [labelTemplateUpdate[1]]
+    );
+
+    if (!templateRows.length) {
+      throw new AppError("Invalid or inactive Master Label template", 400);
     }
   }
 
