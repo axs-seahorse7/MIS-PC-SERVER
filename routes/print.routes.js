@@ -10,7 +10,6 @@ import { updatePrintJobStatus, getBoxPrintJobZpl } from "../controller/print.con
 const router = Router();
 
 const PRIVATE_KEY_PATH = process.env.QZ_PRIVATE_KEY_PATH || path.resolve("./certs/qz-private-key.pem");
-
 const PUBLIC_CERT_PATH = process.env.QZ_PUBLIC_CERT_PATH || path.resolve("./certs/qz-public-cert.pem");
 
 const privateKey = fs.readFileSync(PRIVATE_KEY_PATH, "utf8");

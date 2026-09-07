@@ -315,16 +315,12 @@ export const generateCustomerQrBatch = asyncHandler(async (req, res) => {
     // ----------------------------------------------------------
 
     const [ruleRows] = await conn.query(
-      `SELECT
-         r.*,
-         p.name AS product_name,
-         p.part_code AS product_part_code,
-         p.erp_no AS product_erp_no
-       FROM customer_serial_rules r
-       LEFT JOIN products p
-         ON p.id = r.product_id
-       WHERE r.id = ?
-       FOR UPDATE`,
+      `SELECT r.*, p.name AS product_name, p.part_code AS product_part_code, p.erp_no AS product_erp_no
+      FROM customer_serial_rules r
+      LEFT JOIN products p
+        ON p.id = r.product_id
+      WHERE r.id = ?
+      FOR UPDATE`,
       [id]
     );
 
@@ -579,10 +575,9 @@ export const generateCustomerQrBatch = asyncHandler(async (req, res) => {
       customer_serial: row.qr_code,
 
       product_name: rule.product_name,
-      part_code: rule.product_part_code,
+      part_code: rule.part_code,                 // customer/rule's own part code
+      product_part_code: rule.product_part_code, // product's part code
       erp_no: rule.product_erp_no,
-
-      customer_prefix: rule.part_code,
     }));
 
     // ----------------------------------------------------------

@@ -1054,3 +1054,6 @@ export const testPrintLabelTemplate = asyncHandler(
     });
   }
 );
+
+
+// when a user will create a Customer Label then there should be, both option for part_code, from customer table and from product table, both have part_code, so both should be in option .
