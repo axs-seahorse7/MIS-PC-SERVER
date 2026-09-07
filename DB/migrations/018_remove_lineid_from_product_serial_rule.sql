@@ -5,10 +5,8 @@
 -- ============================================================
 
 -- 1. Create the new product-only unique constraint first.
---
--- This also gives the existing product foreign key
--- its own suitable index before the old composite index
--- is removed.
+-- This provides a dedicated index for product_id before the
+-- old composite unique constraint is removed.
 ALTER TABLE production_serial_rules
 ADD CONSTRAINT uq_production_serial_rules_product
 UNIQUE (product_id);
@@ -19,30 +17,23 @@ ALTER TABLE production_serial_rules
 DROP INDEX uq_production_serial_rules_product_line;
 
 
--- 3. Remove the old line_id index.
---
--- IMPORTANT:
--- fk_production_serial_rules_line is an INDEX in the
--- actual database, NOT a FOREIGN KEY constraint.
+-- 3. Remove the line_id foreign key FIRST.
+ALTER TABLE production_serial_rules
+DROP FOREIGN KEY fk_production_serial_rules_line;
+
+
+-- 4. Remove the line_id supporting index.
 ALTER TABLE production_serial_rules
 DROP INDEX fk_production_serial_rules_line;
 
 
--- 4. Remove line_id.
+-- 5. Remove line_id.
 ALTER TABLE production_serial_rules
 DROP COLUMN line_id;
 
 
 -- ============================================================
--- 5. PRODUCTION QR BUCKETS
--- ============================================================
--- One bucket represents a generated QR batch for a product/week.
---
--- Example:
--- Product = 30K PCB MODEL
--- Week    = 2026 / 36
--- Quantity = 5000
--- Serial  = 00001 -> 05000
+-- 6. PRODUCTION QR BUCKETS
 -- ============================================================
 
 CREATE TABLE production_qr_buckets (
@@ -75,8 +66,7 @@ CREATE TABLE production_qr_buckets (
         ON DELETE CASCADE
         ON UPDATE CASCADE,
 
-    INDEX idx_production_qr_buckets_product
-        (product_id),
+    INDEX idx_production_qr_buckets_product (product_id),
 
     INDEX idx_production_qr_buckets_product_week
         (product_id, current_year, current_week)
@@ -84,18 +74,7 @@ CREATE TABLE production_qr_buckets (
 
 
 -- ============================================================
--- 6. PRODUCTION QR CODES
--- ============================================================
--- One row = one physical QR/serial identity.
---
--- These serials are shared across production lines.
---
--- Example:
---
--- Line 1 order -> 00001 to 02000
--- Line 2 order -> 00001 to 03000
---
--- Both reference the SAME production QR identities.
+-- 7. PRODUCTION QR CODES
 -- ============================================================
 
 CREATE TABLE production_qr_codes (
@@ -134,8 +113,7 @@ CREATE TABLE production_qr_codes (
     CONSTRAINT uq_production_qr_codes_product_serial
         UNIQUE (product_id, serial_no),
 
-    INDEX idx_production_qr_codes_bucket
-        (bucket_id),
+    INDEX idx_production_qr_codes_bucket (bucket_id),
 
     INDEX idx_production_qr_codes_product_status
         (product_id, status)
