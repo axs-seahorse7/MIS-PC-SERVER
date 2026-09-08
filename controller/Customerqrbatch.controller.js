@@ -679,6 +679,7 @@ export const markCustomerQrCodesPrinted = asyncHandler(async (req, res) => {
   res.json({ data: { updated: result.affectedRows } });
 });
 
+
 // ---------------------------------------------------------------------
 // GET /qr-codes/pending
 // Groups un-printed (GENERATED) QR codes by bucket, so a batch that
@@ -706,6 +707,7 @@ export const getPendingQrBatches = asyncHandler(async (req, res) => {
   );
   res.json({ data: rows });
 });
+
 
 // ---------------------------------------------------------------------
 // POST /qr-codes/reprint

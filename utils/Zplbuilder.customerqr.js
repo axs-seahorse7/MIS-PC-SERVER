@@ -5,8 +5,11 @@ const escapeZpl = (value) =>
     .trim();
 
 const getRotation = (rotation) => {
-  const allowed = ["N", "R", "I", "B"];
-  return allowed.includes(rotation) ? rotation : "N";
+  const deg = Number(rotation) || 0;
+  if (deg === 90) return "R";
+  if (deg === 180) return "I";
+  if (deg === 270) return "B";
+  return "N";
 };
 
 const formatTemplateDate = (format = "DD/MM/YY") => {

@@ -63,23 +63,21 @@ const buildTemplateCellZpl = (template, data, offsetX = 0) => {
       // TEXT
       // ----------------------------------------------------------
 
-      if (element.type === "text") {
-        const value = escapeZpl(resolveTextValue(element, data));
-        if (!value) return "";
+    if (element.type === "text") {
+      const value = escapeZpl(resolveTextValue(element, data));
+      if (!value) return "";
 
-        const fontSize = Math.max(1, Number(element.fontSize || 20));
-        const rotation = Number(element.rotation || 0);
-        const orientation = rotation === 90? "R" : rotation === 180? "I"
-              : rotation === 270? "B" : "N";
+      const fontSize = Math.max(1, Number(element.fontSize || 20));
+      const rotation = Number(element.rotation || 0);
+      const orientation = rotation === 90 ? "R" : rotation === 180 ? "I"
+            : rotation === 270 ? "B" : "N";
 
-        const font = element.bold ? "0" : "A";
-
-        return (
-          `^FO${x},${y}` +
-          `^A${font}${orientation},${fontSize},${fontSize}` +
-          `^FD${value}^FS`
-        );
-      }
+      return (
+        `^FO${x},${y}` +
+        `^A0${orientation},${fontSize},${fontSize}` +
+        `^FD${value}^FS`
+      );
+    }
 
       // ----------------------------------------------------------
       // QR
