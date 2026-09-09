@@ -88,7 +88,7 @@ const resolveCustomerQr = async (conn, customerQr) => {
     return {
       ok: false,
       errorType: "CUSTOMER_QR_REQUIRED",
-      message: "Customer QR is required.",
+      message: "Customer QR is required in resolver.",
     };
   }
 
@@ -1818,6 +1818,7 @@ const handleCustomerBinding = async (conn, res, ctx) => {
   } = ctx;
 
 
+
   const pcbQr = String(scanned_value || "").trim();
   const customerQr = String(customer_qr || "").trim();
 
@@ -2322,6 +2323,7 @@ export const submitScan = async (req, res) => {
 
   try {
     const { scanned_value, customer_qr, product_id } = req.body;
+
     const userId = req?.user?.id;
 
     let productionSerial = scanned_value;
@@ -2401,9 +2403,7 @@ export const submitScan = async (req, res) => {
       [product_id]
     );
 
-    const bindingSequence = bindingStageRows.length
-      ? Number(bindingStageRows[0].sequence_no)
-      : null;
+    const bindingSequence = bindingStageRows.length? Number(bindingStageRows[0].sequence_no) : null;
 
     // ============================================================
     // 4. Get Current Stage Flow
@@ -2501,20 +2501,14 @@ export const submitScan = async (req, res) => {
     //     Customer QR is resolved back to Product QR
     // ============================================================
 
-    const isAfterCustomerBinding =
-      bindingSequence !== null &&
-      Number(currentSeq) > bindingSequence;
-
+    const isAfterCustomerBinding = bindingSequence !== null && Number(currentSeq) > bindingSequence;
     if (isAfterCustomerBinding) {
 
       // ==========================================================
       // Customer QR Scan
       // ==========================================================
 
-      customerResolution = await resolveCustomerQr(
-        conn,
-        scanned_value
-      );
+      customerResolution = await resolveCustomerQr(conn, scanned_value);
 
       if (!customerResolution.ok) {
         return res.status(400).json({
@@ -2617,20 +2611,14 @@ export const submitScan = async (req, res) => {
       production_serial: productionSerial,
 
       // Customer QR information
-      customer_qr:
-        customerBinding?.customer_qr ||
-        (isCustomerQrScan ? scanned_value : null),
+      customer_qr: customerBinding?.customer_qr || (isCustomerQrScan ? scanned_value : customer_qr || null),
 
-      customer_binding_id:
-        customerBinding?.binding_id || null,
+      customer_binding_id: customerBinding?.binding_id || null,
 
       // IMPORTANT:
       // For Customer QR scans this comes directly from the binding.
-      production_order_id:
-        customerBinding?.production_order_id || null,
-
+      production_order_id: customerBinding?.production_order_id || null,
       isCustomerQrScan,
-
       product_id: resolvedProductId,
 
       currentSeq,
@@ -2954,6 +2942,7 @@ export const createGroup = async (req, res) => {
   }
 };
 
+
 export const getTenLatestScans = async (req, res) => {
   const conn = await pool.getConnection();
 
@@ -2980,7 +2969,7 @@ export const getTenLatestScans = async (req, res) => {
     }
 
     const [rows] = await conn.query(
-      `
+      ` 
       SELECT
         sh.id,
         sh.scanned_value,
@@ -2994,7 +2983,9 @@ export const getTenLatestScans = async (req, res) => {
 
         po.order_no AS production_order_no,
 
-        s.name AS stage_name
+        s.name AS stage_name,
+
+        cb.customer_qr
 
       FROM scan_history sh
 
@@ -3009,6 +3000,10 @@ export const getTenLatestScans = async (req, res) => {
 
       LEFT JOIN stages s
         ON s.id = sh.stage_id
+
+      LEFT JOIN customer_bindings cb
+        ON cb.pcb_qr = sh.scanned_value
+      AND cb.stage_id = sh.stage_id
 
       WHERE sh.factory_id = ?
         AND sh.line_id = ?
@@ -3049,3 +3044,4 @@ export const getTenLatestScans = async (req, res) => {
     conn.release();
   }
 };
+
