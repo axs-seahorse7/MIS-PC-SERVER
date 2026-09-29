@@ -90,60 +90,91 @@ export const deleteExternalSource = async (req, res) => {
 // they should report results for. No create/update/delete here.
 export const getMachineByCode = async (req, res) => {
   try {
-    const { machineCode } = req.params;
+    const machineCode = req.params.machineCode?.trim();
 
     if (!machineCode) {
-      return res.status(400).json({ message: "Machine Code is required" });
+      return res.status(400).json({
+        success: false,
+        message: "Machine Code is required"
+      });
     }
 
-    const [rows] = await pool.query(
+    // 1. Resolve machine -> stage -> line (machine_code is globally unique)
+    const [stageRows] = await pool.query(
       `
       SELECT
-          psf.machine_code,
-          psf.external_source_type,
-          psf.external_source,
-          psf.external_machine_type,
-          psf.external_folder_path,
-          psf.external_poll_interval_minutes,
-          psf.external_file_extensions,
-          psf.external_api_config,
-          pl.code AS line_code,
+          s.id AS stage_id,
           s.name AS stage_name,
-          s.line_id AS stage_line_id
-      FROM product_stage_flow psf
-      LEFT JOIN stages s
-          ON s.id = psf.stage_id
+          s.machine_code,
+          s.is_active,
+          s.line_id,
+          pl.code AS line_code
+      FROM stages s
       LEFT JOIN production_lines pl
           ON pl.id = s.line_id
-      WHERE psf.machine_code = ?
+      WHERE s.machine_code = ?
       LIMIT 1;
       `,
       [machineCode]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ message: "Machine not found" });
+    if (!stageRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Machine not found"
+      });
     }
 
-    const row = rows[0];
+    const stage = stageRows[0];
+
+    if (!stage.is_active) {
+      return res.status(403).json({
+        success: false,
+        message: "Machine is linked to an inactive stage"
+      });
+    }
+
+    // 2. Fetch external config for this stage (still stored on product_stage_flow)
+    const [cfgRows] = await pool.query(
+      `
+      SELECT
+          psf.external_source,
+          psf.external_source_type,
+          psf.external_machine_type,
+          psf.external_folder_path,
+          psf.external_poll_interval_minutes,
+          psf.external_file_extensions,
+          psf.external_api_config
+      FROM product_stage_flow psf
+      WHERE psf.stage_id = ?
+        AND psf.is_external_dependency = 1
+      ORDER BY psf.id ASC
+      LIMIT 1;
+      `,
+      [stage.stage_id]
+    );
+
+    const cfg = cfgRows[0] || {};
 
     return res.status(200).json({
       success: true,
       message: "Machine configuration fetched successfully.",
       data: {
-        machineCode: row.machine_code,
-        machineName: row.external_source,
-        machineType: row.external_machine_type,
+        machineCode: stage.machine_code,
+        machineName: cfg.external_source ?? null,
+        machineType: cfg.external_machine_type ?? null,
 
-        lineCode: row.line_code,
-        stageName: row.stage_name,
+        lineId: stage.line_id,
+        lineCode: stage.line_code,
+        stageId: stage.stage_id,
+        stageName: stage.stage_name,
         stationCode: null,
 
-        sourceType: row.external_source_type,
-        watchFolder: row.external_folder_path,
-        pollInterval: row.external_poll_interval_minutes,
-        fileExtensions: row.external_file_extensions,
-        apiConfig: row.external_api_config
+        sourceType: cfg.external_source_type ?? null,
+        watchFolder: cfg.external_folder_path ?? null,
+        pollInterval: cfg.external_poll_interval_minutes ?? null,
+        fileExtensions: cfg.external_file_extensions ?? null,
+        apiConfig: cfg.external_api_config ?? null
       }
     });
   } catch (error) {

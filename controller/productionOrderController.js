@@ -5,6 +5,133 @@ import { pool } from "../DB/config/mysql.config.js";
 // ============================================================
 
 
+// Add getReusableQr and replace createProductionOrder in your production order controller.
+// Route (must be registered BEFORE the "/:id" GET route, or "reusable-qr" is read as an id):
+//   router.get("/reusable-qr", <same auth middleware>, getReusableQr);
+
+// ------------------------------------------------------------------
+// Unused QR identities left over in CANCELLED orders of the same
+// product + line.
+//
+// "Unused" means the serial was never scanned anywhere (scan_history)
+// and never tested by a machine (ict_results — rename to machine_results
+// when you rename the table), and is not REJECTED. A machine result left
+// over from an earlier test would otherwise let a reused serial pass the
+// external check without being tested again.
+// ------------------------------------------------------------------
+const REUSABLE_ITEMS_SQL = `
+  SELECT
+    poi.id,
+    poi.production_order_id,
+    poi.serial_no,
+    po.order_no
+  FROM production_order_items poi
+  INNER JOIN production_orders po
+    ON po.id = poi.production_order_id
+  WHERE po.status = 'CANCELLED'
+    AND po.product_id = ?
+    AND po.line_id = ?
+    AND poi.status = 'ACTIVE'
+    AND NOT EXISTS (
+      SELECT 1 FROM scan_history sh
+      WHERE sh.scanned_value = poi.serial_no
+    )
+        AND NOT EXISTS (
+      SELECT 1 FROM ict_results ir
+      WHERE ir.serial_no = poi.serial_no
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM production pr
+      WHERE pr.serial_no = poi.serial_no
+    )
+`;
+
+const httpError = (status, message) =>
+  Object.assign(new Error(message), { status });
+
+// ------------------------------------------------------------------
+// GET /production-orders/reusable-qr?productId=&lineId=
+//
+// Used by the New Production Order modal to decide whether to ask
+// "reuse cancelled QR or use new QR serials?".
+// ------------------------------------------------------------------
+export const getReusableQr = async (req, res) => {
+  try {
+    const productId = Number(req.query.productId);
+    const lineId = Number(req.query.lineId);
+
+    if (!productId || !lineId) {
+      return res.status(400).json({
+        message: "productId and lineId are required",
+      });
+    }
+
+    const [rows] = await pool.query(
+      `${REUSABLE_ITEMS_SQL} ORDER BY po.id ASC, poi.id ASC`,
+      [productId, lineId]
+    );
+
+    const groupMap = new Map();
+
+    for (const row of rows) {
+      // One line per serial format (formats differ in length, and within
+      // one format the strings sort in serial order).
+      const key = `${row.production_order_id}-${row.serial_no.length}`;
+
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          orderId: row.production_order_id,
+          orderNo: row.order_no,
+          count: 0,
+          from: row.serial_no,
+          to: row.serial_no,
+        });
+      }
+
+      const group = groupMap.get(key);
+      group.count += 1;
+      if (row.serial_no < group.from) group.from = row.serial_no;
+      if (row.serial_no > group.to) group.to = row.serial_no;
+    }
+
+    // Fresh QR identities that can still go to this line
+    const [freshRows] = await pool.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM production_qr_codes q
+        WHERE q.product_id = ?
+        AND q.status IN ('GENERATED', 'PRINTED')
+        AND NOT EXISTS (
+          SELECT 1 FROM production pr
+          WHERE pr.serial_no = q.qr_data
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM production_order_items poi
+          INNER JOIN production_orders po
+            ON po.id = poi.production_order_id
+          WHERE po.line_id = ?
+            AND po.product_id = ?
+            AND poi.serial_no = q.qr_data
+        )
+      `,
+      [productId, lineId, productId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        availableCount: rows.length,
+        groups: Array.from(groupMap.values()),
+        freshAvailable: Number(freshRows[0].count),
+      },
+    });
+  } catch (error) {
+    console.error("ERR IN GET REUSABLE QR:", error);
+    return res.status(500).json({ message: error.message });
+  }
+};
+
 export const createProductionOrder = async (req, res) => {
   const connection = await pool.getConnection();
 
@@ -15,6 +142,9 @@ export const createProductionOrder = async (req, res) => {
       targetQty,
       sequenceMode = "NON_SEQUENTIAL",
       plannedDate,
+      // "NEW"       -> next unassigned QR identities (default, old behaviour)
+      // "CANCELLED" -> unused QR identities left in cancelled orders
+      qrSource = "NEW",
     } = req.body;
 
     // ============================================================
@@ -69,6 +199,12 @@ export const createProductionOrder = async (req, res) => {
     if (!["SEQUENTIAL", "NON_SEQUENTIAL"].includes(sequenceMode)) {
       return res.status(400).json({
         message: "sequenceMode must be SEQUENTIAL or NON_SEQUENTIAL",
+      });
+    }
+
+    if (!["NEW", "CANCELLED"].includes(qrSource)) {
+      return res.status(400).json({
+        message: "qrSource must be NEW or CANCELLED",
       });
     }
 
@@ -177,9 +313,9 @@ export const createProductionOrder = async (req, res) => {
     // ============================================================
     // GET PRODUCT SERIAL RULE
     //
-    // IMPORTANT:
-    // Product-level only.
-    // Production Order does NOT generate serials.
+    // FOR UPDATE doubles as a per-product lock: two people creating
+    // orders for the same product are handled one after the other,
+    // so they can never be given the same QR identities.
     // ============================================================
 
     const [serialRuleRows] = await connection.query(
@@ -196,6 +332,7 @@ export const createProductionOrder = async (req, res) => {
       WHERE product_id = ?
         AND is_active = 1
       LIMIT 1
+      FOR UPDATE
       `,
       [productId]
     );
@@ -256,116 +393,92 @@ export const createProductionOrder = async (req, res) => {
     }
 
     // ============================================================
-    // FIND AVAILABLE QR IDENTITIES
+    // SELECT QR IDENTITIES
     //
-    // IMPORTANT:
-    // QR pool is PRODUCT-level.
-    //
-    // Production orders DO NOT consume the QR pool.
-    //
-    // The same QR identity may be assigned to different
-    // production lines.
+    // Rule: the same QR on different lines is allowed, the same QR
+    // twice on the same line is not.
     // ============================================================
 
-    const [qrRows] = await connection.query(
-      `
-      SELECT
-        id,
-        bucket_id,
-        product_id,
-        serial_no,
-        qr_data,
-        status
-      FROM production_qr_codes
-      WHERE product_id = ?
-        AND status IN ('GENERATED', 'PRINTED')
-      ORDER BY id ASC
-      `,
-      [productId]
-    );
+    let selectedQr = []; // [{ qr_data }]
+    let oldItemIds = []; // items moved out of cancelled orders
+    let reusedFromOrders = [];
 
-    if (qrRows.length < quantity) {
-      throw new Error(
-        `Insufficient generated Product QR codes. Required: ${quantity}, available: ${qrRows.length}`
+    if (qrSource === "CANCELLED") {
+      // ----------------------------------------------------------
+      // Reuse unused identities from cancelled orders (same product
+      // + same line), oldest cancelled order first.
+      // ----------------------------------------------------------
+
+      const [reusableRows] = await connection.query(
+        `${REUSABLE_ITEMS_SQL}
+         ORDER BY po.id ASC, poi.id ASC
+         LIMIT ?
+         FOR UPDATE`,
+        [productId, lineId, quantity]
       );
-    }
 
-    // ============================================================
-    // SELECT QR IDENTITIES NOT ALREADY ASSIGNED TO THIS LINE
-    //
-    // IMPORTANT:
-    //
-    // Same QR on different lines = ALLOWED
-    // Same QR on same line = NOT ALLOWED
-    // ============================================================
+      if (reusableRows.length < quantity) {
+        throw httpError(
+          409,
+          `Only ${reusableRows.length} unused Product QR identities are available from cancelled orders. Required: ${quantity}`
+        );
+      }
 
-    const candidateQrRows = [];
+      selectedQr = reusableRows.map((row) => ({ qr_data: row.serial_no }));
+      oldItemIds = reusableRows.map((row) => row.id);
 
-    for (const qr of qrRows) {
-      const [existingRows] = await connection.query(
+      const counts = new Map();
+
+      reusableRows.forEach((row) => {
+        counts.set(row.order_no, (counts.get(row.order_no) || 0) + 1);
+      });
+
+      reusedFromOrders = Array.from(counts, ([orderNo, count]) => ({
+        orderNo,
+        count,
+      }));
+    } else {
+      // ----------------------------------------------------------
+      // Next generated QR identities not yet assigned on this line.
+      // Leftovers in cancelled orders are still assigned to those
+      // orders on this line, so they are skipped here and stay
+      // available for reuse.
+      // ----------------------------------------------------------
+
+      const [candidateQrRows] = await connection.query(
         `
-        SELECT poi.id
-        FROM production_order_items poi
+        SELECT q.id, q.qr_data
+        FROM production_qr_codes q
+               WHERE q.product_id = ?
+          AND q.status IN ('GENERATED', 'PRINTED')
+          AND NOT EXISTS (
+            SELECT 1 FROM production pr
+            WHERE pr.serial_no = q.qr_data
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM production_order_items poi
 
-        INNER JOIN production_orders po
-          ON po.id = poi.production_order_id
-
-        WHERE po.line_id = ?
-          AND po.product_id = ?
-          AND poi.serial_no = ?
-
-        LIMIT 1
+            INNER JOIN production_orders po
+              ON po.id = poi.production_order_id
+            WHERE po.line_id = ?
+              AND po.product_id = ?
+              AND poi.serial_no = q.qr_data
+          )
+        ORDER BY q.id ASC
+        LIMIT ?
         `,
-        [lineId, productId, qr.qr_data]
+        [productId, lineId, productId, quantity]
       );
 
-      if (!existingRows.length) {
-        candidateQrRows.push(qr);
+      if (candidateQrRows.length < quantity) {
+        throw httpError(
+          409,
+          `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
+        );
       }
 
-      if (candidateQrRows.length >= quantity) {
-        break;
-      }
-    }
-
-    if (candidateQrRows.length < quantity) {
-      throw new Error(
-        `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
-      );
-    }
-
-    // ============================================================
-    // LOCK SELECTED QR IDENTITIES
-    //
-    // Re-check after locking to prevent concurrent assignment.
-    // ============================================================
-
-    const qrIds = candidateQrRows.map((row) => row.id);
-    const placeholders = qrIds.map(() => "?").join(",");
-
-    const [lockedQrRows] = await connection.query(
-      `
-      SELECT
-        id,
-        bucket_id,
-        product_id,
-        serial_no,
-        qr_data,
-        status
-      FROM production_qr_codes
-      WHERE id IN (${placeholders})
-        AND product_id = ?
-        AND status IN ('GENERATED', 'PRINTED')
-      ORDER BY id ASC
-      FOR UPDATE
-      `,
-      [...qrIds, productId]
-    );
-
-    if (lockedQrRows.length < quantity) {
-      throw new Error(
-        "Some selected Product QR codes are no longer available"
-      );
+      selectedQr = candidateQrRows.map((row) => ({ qr_data: row.qr_data }));
     }
 
     // ============================================================
@@ -406,23 +519,24 @@ export const createProductionOrder = async (req, res) => {
     }
 
     const orderNo = `${datePrefix}${String(orderNumber).padStart(3, "0")}`;
-    
+
     // ============================================================
     // LEGACY SERIAL SNAPSHOT
     //
-    // Keep these fields because the current production_orders
-    // schema still contains them.
-    //
-    // IMPORTANT:
-    // They are NOT used to generate or control QR identities.
+    // Display only. production_order_items is the source of truth,
+    // because reused identities are not always one continuous range.
     // ============================================================
 
-    const firstQr = lockedQrRows[0];
+    const firstQr = selectedQr[0];
 
     const serialStart = 1;
     const serialEnd = quantity;
 
-    const serialPrefix = firstQr.qr_data?.slice(0, Math.max(0, firstQr.qr_data.length - serialWidth)) || "";
+    const serialPrefix =
+      firstQr.qr_data?.slice(
+        0,
+        Math.max(0, firstQr.qr_data.length - serialWidth)
+      ) || "";
 
     // ============================================================
     // CREATE PRODUCTION ORDER
@@ -466,36 +580,47 @@ export const createProductionOrder = async (req, res) => {
     const productionOrderId = orderResult.insertId;
 
     // ============================================================
-    // CREATE PRODUCTION ORDER ITEMS
+    // MOVE REUSED ITEMS OUT OF THE CANCELLED ORDERS
     //
-    // Complete physical QR identity is stored.
-    //
-    // sequence_no is LOCAL to this production order.
+    // The cancelled order keeps only what it actually consumed;
+    // the rest now belongs to the new order.
     // ============================================================
 
-    const itemValues = lockedQrRows
-      .slice(0, quantity)
-      .map((qr, index) => [
-        productionOrderId,
-        qr.qr_data,
-        index + 1,
-        "ACTIVE",
-      ]);
-
-    if (itemValues.length) {
+    if (oldItemIds.length) {
       await connection.query(
         `
-        INSERT INTO production_order_items (
-          production_order_id,
-          serial_no,
-          sequence_no,
-          status
-        )
-        VALUES ?
+        DELETE FROM production_order_items
+        WHERE id IN (?)
         `,
-        [itemValues]
+        [oldItemIds]
       );
     }
+
+    // ============================================================
+    // CREATE PRODUCTION ORDER ITEMS
+    //
+    // sequence_no is LOCAL to this production order (1..quantity).
+    // ============================================================
+
+    const itemValues = selectedQr.map((qr, index) => [
+      productionOrderId,
+      qr.qr_data,
+      index + 1,
+      "ACTIVE",
+    ]);
+
+    await connection.query(
+      `
+      INSERT INTO production_order_items (
+        production_order_id,
+        serial_no,
+        sequence_no,
+        status
+      )
+      VALUES ?
+      `,
+      [itemValues]
+    );
 
     // ============================================================
     // CREATE PRODUCTION ORDER STAGES
@@ -559,9 +684,12 @@ export const createProductionOrder = async (req, res) => {
 
         serialRuleId: serialRule.id,
 
+        qrSource,
+        reusedFromOrders,
+
         qrRange: {
-          from: lockedQrRows[0].qr_data,
-          to: lockedQrRows[quantity - 1].qr_data,
+          from: selectedQr[0].qr_data,
+          to: selectedQr[quantity - 1].qr_data,
         },
 
         sequenceMode,
@@ -586,7 +714,7 @@ export const createProductionOrder = async (req, res) => {
       });
     }
 
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       message: error.message,
     });
   } finally {
@@ -1341,13 +1469,10 @@ export const startProductionOrder = async (req, res) => {
 
     // ============================================================
     // 5. Master Label Configuration
+    //    (only if the product has a packaging stage)
     //
-    // Only calculate how many Master Labels this PO requires.
-    //
-    // No serial-capacity check.
-    // No current_serial check.
-    // No PRINTED check.
-    // No QR-pool check.
+    // No active packaging_config = no packaging stage, so no
+    // Master Labels are needed and the order starts normally.
     // ============================================================
 
     const [packagingRows] = await connection.query(
@@ -1367,35 +1492,32 @@ export const startProductionOrder = async (req, res) => {
       [order.product_id]
     );
 
-    if (!packagingRows.length) {
-      await connection.rollback();
-
-      return res.status(400).json({
-        success: false,
-        errorType: "MASTER_LABEL_CONFIG_REQUIRED",
-        message:
-          "Active Master Label packaging configuration is required for this product.",
-      });
-    }
-
-    const packagingConfig = packagingRows[0];
-
-    const boxSize = Number(packagingConfig.box_size);
     const targetQty = Number(order.target_qty || 0);
 
-    if (boxSize <= 0) {
-      await connection.rollback();
+    let masterLabel = null;
 
-      return res.status(400).json({
-        success: false,
-        errorType: "INVALID_MASTER_LABEL_BOX_SIZE",
-        message: "Master Label box size must be greater than zero.",
-      });
+    if (packagingRows.length) {
+      const packagingConfig = packagingRows[0];
+      const boxSize = Number(packagingConfig.box_size);
+
+      if (!(boxSize > 0)) {
+        await connection.rollback();
+
+        return res.status(400).json({
+          success: false,
+          errorType: "INVALID_MASTER_LABEL_BOX_SIZE",
+          message: "Master Label box size must be greater than zero.",
+        });
+      }
+
+      masterLabel = {
+        boxSize,
+        requiredLabels: Math.ceil(targetQty / boxSize),
+        packagingConfigId: packagingConfig.id,
+        printerId: packagingConfig.printer_id,
+        labelTemplateId: packagingConfig.label_template_id,
+      };
     }
-
-    const requiredMasterLabels = Math.ceil(
-      targetQty / boxSize
-    );
 
     // ============================================================
     // 6. Check Production Order Stages
@@ -1490,14 +1612,8 @@ export const startProductionOrder = async (req, res) => {
         stageCount: stageRows.length,
         itemCount,
 
-        // Master Label
-        masterLabel: {
-          boxSize,
-          requiredLabels: requiredMasterLabels,
-          packagingConfigId: packagingConfig.id,
-          printerId: packagingConfig.printer_id,
-          labelTemplateId: packagingConfig.label_template_id,
-        },
+        // Master Label (null when the product has no packaging stage)
+        masterLabel,
       },
     });
 
@@ -1777,6 +1893,111 @@ export const getProductionOrderById = async (req, res) => {
     });
   } catch (error) {
     console.error("ERR IN GET PRODUCTION ORDER BY ID:", error);
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+// GET /production-orders/:id/items?page=1&pageSize=50&status=PENDING&search=PS0012
+export const getProductionOrderItems = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 50, 1), 100);
+    const offset = (page - 1) * pageSize;
+
+    const status = req.query.status || null; // PENDING | IN_PROGRESS | COMPLETED | REJECTED
+    const search = String(req.query.search || "").trim();
+
+    // One row per serial with its progress. Assumes one row per serial in
+    // `production` (index production.serial_no).
+    const baseSql = `
+      SELECT
+        poi.sequence_no,
+        poi.serial_no,
+        CASE
+          WHEN poi.status = 'REJECTED' THEN 'REJECTED'
+          ELSE COALESCE(pr.status, 'PENDING')
+        END AS status
+      FROM production_order_items poi
+      LEFT JOIN production pr
+        ON pr.serial_no = poi.serial_no
+      WHERE poi.production_order_id = ?
+    `;
+
+    const filters = [];
+    const filterParams = [];
+
+    if (status) {
+      filters.push("t.status = ?");
+      filterParams.push(status);
+    }
+
+    if (search) {
+      filters.push("t.serial_no LIKE ?");
+      filterParams.push(`%${search}%`);
+    }
+
+    const whereSql = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const [
+      [itemRows],
+      [countRows],
+      [summaryRows],
+      [firstRows],
+      [lastRows],
+    ] = await Promise.all([
+      pool.query(
+        `SELECT t.sequence_no, t.serial_no, t.status
+         FROM (${baseSql}) t
+         ${whereSql}
+         ORDER BY t.sequence_no ASC
+         LIMIT ? OFFSET ?`,
+        [id, ...filterParams, pageSize, offset]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS total FROM (${baseSql}) t ${whereSql}`,
+        [id, ...filterParams]
+      ),
+      pool.query(
+        `SELECT t.status, COUNT(*) AS count
+         FROM (${baseSql}) t
+         GROUP BY t.status`,
+        [id]
+      ),
+      pool.query(
+        `SELECT serial_no FROM production_order_items
+         WHERE production_order_id = ?
+         ORDER BY sequence_no ASC LIMIT 1`,
+        [id]
+      ),
+      pool.query(
+        `SELECT serial_no FROM production_order_items
+         WHERE production_order_id = ?
+         ORDER BY sequence_no DESC LIMIT 1`,
+        [id]
+      ),
+    ]);
+
+    const summary = { PENDING: 0, IN_PROGRESS: 0, COMPLETED: 0, REJECTED: 0 };
+    summaryRows.forEach((row) => {
+      summary[row.status] = Number(row.count);
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        items: itemRows,
+        total: Number(countRows[0].total),
+        page,
+        pageSize,
+        summary,
+        first_serial: firstRows[0]?.serial_no || null,
+        last_serial: lastRows[0]?.serial_no || null,
+      },
+    });
+  } catch (error) {
+    console.error("ERR IN GET PRODUCTION ORDER ITEMS:", error);
     return res.status(500).json({ message: error.message });
   }
 };

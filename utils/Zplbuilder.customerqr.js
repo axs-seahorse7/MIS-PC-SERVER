@@ -81,6 +81,7 @@ const resolveElementValue = (element, data = {}) => {
  *   label 2 -> offsetX 400
  *   label 3 -> offsetX 800
  */
+
 const buildTemplateCellZpl = (
   template,
   data,

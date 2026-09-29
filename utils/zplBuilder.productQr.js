@@ -1,7 +1,6 @@
 // utils/zplBuilder.productQr.js
 
-const escapeZpl = (value = "") =>
-  String(value)
+const escapeZpl = (value = "") => String(value)
     .replace(/\\/g, "\\\\")
     .replace(/\^/g, " ")
     .replace(/~/g, " ");
@@ -54,7 +53,6 @@ const resolveTextValue = (element, data = {}) => {
 const buildTemplateCellZpl = (template, data, offsetX = 0) => {
   const elements = Array.isArray(template.elements)? template.elements : [];
 
-
   return elements.map((element) => {
       const x = Number(offsetX) + Number(element.x || 0);
       const y =Number(element.y || 0);
@@ -97,19 +95,16 @@ const buildTemplateCellZpl = (template, data, offsetX = 0) => {
       }
 
       return "";
-    })
-    .filter(Boolean)
-    .join("");
+
+      
+    }).filter(Boolean).join("");
 };
 
 // ---------------------------------------------------------------------
 // Build one row of Product QR labels
 // ---------------------------------------------------------------------
 
-export const buildProductQrRowZpl = (
-  template,
-  labels
-) => {
+export const buildProductQrRowZpl = (template, labels) => {
   if (!template) {
     throw new Error(
       "Product QR template is required"

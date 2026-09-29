@@ -306,16 +306,18 @@ export const validateProductionOrderSequence = async (
   // 5. Production Order must be RUNNING
   // ============================================================
 
-  if (item.order_status !== "RUNNING") {
-    return {
-      ok: false,
-      errorType: "PRODUCTION_ORDER_NOT_RUNNING",
-      message:
-        `This serial belongs to production order ${item.order_no}, ` +
-        `which is currently ${item.order_status}.`,
-      productionOrderId: item.production_order_id,
-    };
-  }
+    if (item.order_status !== "RUNNING") {
+      const isCancelled = item.order_status === "CANCELLED";
+
+      return {
+        ok: false,
+        errorType: "PRODUCTION_ORDER_NOT_RUNNING",
+        message: isCancelled
+          ? `This serial was used in cancelled production order ${item.order_no} and is not part of the running order. Scan a serial assigned to the running order.`
+          : `This serial belongs to production order ${item.order_no}, which is currently ${item.order_status}.`,
+        productionOrderId: item.production_order_id,
+      };
+    }
 
   // ============================================================
   // 6. Rejected item

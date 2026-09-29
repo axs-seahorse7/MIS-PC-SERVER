@@ -344,544 +344,544 @@ export const getProductionQrGenerationPreview = asyncHandler(async (req, res) =>
 // }
 // ------------------------------------------------------------
 
-    export const generateProductionQrCodes = asyncHandler(async (req, res) => {
-        const { id } = req.params;
+export const generateProductionQrCodes = asyncHandler(async (req, res) => {
+    const { id } = req.params;
 
-        const quantity =
-        Number(req.body.quantity);
+    const quantity =
+    Number(req.body.quantity);
 
-        const printerId =
-        req.body.printer_id;
+    const printerId =
+    req.body.printer_id;
 
-        const templateId =
-        req.body.template_id;
+    const templateId =
+    req.body.template_id;
 
-        if (
-        !Number.isInteger(quantity) ||
-        quantity < 1
-        ) {
-        throw new AppError(
-            "quantity must be a positive integer",
-            400
-        );
-        }
+    if (
+    !Number.isInteger(quantity) ||
+    quantity < 1
+    ) {
+    throw new AppError(
+        "quantity must be a positive integer",
+        400
+    );
+    }
 
-        if (
-        quantity > MAX_BATCH_QUANTITY
-        ) {
-        throw new AppError(
-            `Maximum ${MAX_BATCH_QUANTITY} product QR codes can be generated at once`,
-            400
-        );
-        }
+    if (
+    quantity > MAX_BATCH_QUANTITY
+    ) {
+    throw new AppError(
+        `Maximum ${MAX_BATCH_QUANTITY} product QR codes can be generated at once`,
+        400
+    );
+    }
 
-        if (!printerId) {
-        throw new AppError(
-            "printer_id is required",
-            400
-        );
-        }
+    if (!printerId) {
+    throw new AppError(
+        "printer_id is required",
+        400
+    );
+    }
 
-        if (!templateId) {
-        throw new AppError(
-            "template_id is required",
-            400
-        );
-        }
+    if (!templateId) {
+    throw new AppError(
+        "template_id is required",
+        400
+    );
+    }
 
-        const conn =
-        await pool.getConnection();
+    const conn =
+    await pool.getConnection();
 
-        try {
-        await conn.beginTransaction();
+    try {
+    await conn.beginTransaction();
 
-        // ------------------------------------------------------
-        // 1. Lock serial rule + product
-        // ------------------------------------------------------
+    // ------------------------------------------------------
+    // 1. Lock serial rule + product
+    // ------------------------------------------------------
 
-        const [ruleRows] =
-            await conn.query(
-            `
-            SELECT
-                psr.*,
-
-                p.name AS product_name,
-                p.part_code,
-                p.erp_no,
-                p.is_active AS product_active
-
-            FROM production_serial_rules psr
-
-            JOIN products p
-                ON p.id = psr.product_id
-
-            WHERE psr.id = ?
-
-            FOR UPDATE
-            `,
-            [id]
-            );
-
-        if (!ruleRows.length) {
-            throw new AppError(
-            "Production serial rule not found",
-            404
-            );
-        }
-
-        const ruleRecord =
-            ruleRows[0];
-
-        if (!ruleRecord.is_active) {
-            throw new AppError(
-            "This production serial rule is inactive",
-            409
-            );
-        }
-
-        if (!ruleRecord.product_active) {
-            throw new AppError(
-            "Product configured for this rule is inactive",
-            409
-            );
-        }
-
-        const product = {
-            id: ruleRecord.product_id,
-            name: ruleRecord.product_name,
-            part_code: ruleRecord.part_code,
-            erp_no: ruleRecord.erp_no,
-        };
-
-        const rule = parseRule(
-            ruleRecord.rule
-        );
-
-        const { width } =
-            getSerialSegment(rule);
-
-        // ------------------------------------------------------
-        // 2. Current ISO year/week
-        // ------------------------------------------------------
-
-        const {
-            year,
-            week,
-        } = getIsoYearWeek();
-
-        let nextSerial =
-            Number(
-            ruleRecord.next_serial
-            ) || 1;
-
-        // ------------------------------------------------------
-        // 3. Automatic weekly reset
-        // ------------------------------------------------------
-
-        if (
-            Number(
-            ruleRecord.current_year
-            ) !== year ||
-            Number(
-            ruleRecord.current_week
-            ) !== week
-        ) {
-            nextSerial = 1;
-
-            await conn.query(
-            `
-            UPDATE production_serial_rules
-            SET
-                current_year = ?,
-                current_week = ?,
-                next_serial = 1,
-                updated_at = NOW()
-            WHERE id = ?
-            `,
-            [
-                year,
-                week,
-                id,
-            ]
-            );
-        }
-
-        // ------------------------------------------------------
-        // 4. Weekly range validation
-        // ------------------------------------------------------
-
-        const maxSerial =
-            10 ** width - 1;
-
-        const startSerial =
-            nextSerial;
-
-        const endSerial =
-            startSerial +
-            quantity -
-            1;
-
-        if (
-            endSerial >
-            maxSerial
-        ) {
-            const remaining =
-            Math.max(
-                maxSerial -
-                startSerial +
-                1,
-                0
-            );
-
-            throw new AppError(
-            `Requested quantity exceeds the available range for this week. Only ${remaining} serials remain.`,
-            409
-            );
-        }
-
-        // ------------------------------------------------------
-        // 5. Prevent collision with previously generated
-        //    physical QR identities.
-        // ------------------------------------------------------
-
-        const generationDate = new Date();
-        const previewQrData = [];
-
-        for (let serial = startSerial; serial <= endSerial; serial++) {
-        const qrData = buildQrData({
-            rule,
-            product,
-            serial,
-            date: generationDate,
-        });
-
-        if (!qrData) {
-            throw new AppError(
-            `Failed to generate QR data for serial ${String(serial).padStart(width, "0")}`,
-            500
-            );
-        }
-
-        previewQrData.push(qrData);
-        }
-
-        const [collisionRows] = await conn.query(
+    const [ruleRows] =
+        await conn.query(
         `
-        SELECT serial_no
-        FROM production_qr_codes
-        WHERE product_id = ?
-            AND serial_no IN (?)
-        LIMIT 1
+        SELECT
+            psr.*,
+
+            p.name AS product_name,
+            p.part_code,
+            p.erp_no,
+            p.is_active AS product_active
+
+        FROM production_serial_rules psr
+
+        JOIN products p
+            ON p.id = psr.product_id
+
+        WHERE psr.id = ?
+
+        FOR UPDATE
         `,
-        [product.id, previewQrData]
+        [id]
         );
 
-        if (collisionRows.length) {
+    if (!ruleRows.length) {
         throw new AppError(
-            `QR identity already exists: ${collisionRows[0].serial_no}`,
-            409
+        "Production serial rule not found",
+        404
         );
-        }
+    }
 
-        // ------------------------------------------------------
-        // 6. Validate printer
-        // ------------------------------------------------------
+    const ruleRecord =
+        ruleRows[0];
 
-        const [printerRows] =
-            await conn.query(
-            `
-            SELECT
-                id,
-                name,
-                printer_name,
-                is_active
+    if (!ruleRecord.is_active) {
+        throw new AppError(
+        "This production serial rule is inactive",
+        409
+        );
+    }
 
-            FROM printers
+    if (!ruleRecord.product_active) {
+        throw new AppError(
+        "Product configured for this rule is inactive",
+        409
+        );
+    }
 
-            WHERE id = ?
-                AND is_active = 1
+    const product = {
+        id: ruleRecord.product_id,
+        name: ruleRecord.product_name,
+        part_code: ruleRecord.part_code,
+        erp_no: ruleRecord.erp_no,
+    };
 
-            LIMIT 1
-            `,
-            [printerId]
-            );
+    const rule = parseRule(
+        ruleRecord.rule
+    );
 
-        if (!printerRows.length) {
-            throw new AppError(
-            "Selected printer not found or inactive",
-            404
-            );
-        }
+    const { width } =
+        getSerialSegment(rule);
 
-        const printer =
-            printerRows[0];
+    // ------------------------------------------------------
+    // 2. Current ISO year/week
+    // ------------------------------------------------------
 
-        if (!printer.printer_name) {
-            throw new AppError(
-            "Selected printer is missing printer_name",
-            400
-            );
-        }
+    const {
+        year,
+        week,
+    } = getIsoYearWeek();
 
-        // ------------------------------------------------------
-        // 7. Validate Product QR template
-        // ------------------------------------------------------
+    let nextSerial =
+        Number(
+        ruleRecord.next_serial
+        ) || 1;
 
-        const [templateRows] =
-            await conn.query(
-            `
-            SELECT
-                id,
-                name,
-                template_type,
-                dpi,
-                width,
-                height,
-                pitch_x,
-                pitch_y,
-                elements,
-                is_active
+    // ------------------------------------------------------
+    // 3. Automatic weekly reset
+    // ------------------------------------------------------
 
-            FROM label_templates
-
-            WHERE id = ?
-                AND template_type = 'PRODUCT_QR'
-                AND is_active = 1
-
-            LIMIT 1
-            `,
-            [templateId]
-            );
-
-        if (!templateRows.length) {
-            throw new AppError(
-            "Selected product QR template not found or inactive",
-            404
-            );
-        }
-
-        const template = templateRows[0];
-
-        if (!Number.isFinite(Number(template.width)) ||Number(template.width) <= 0) {
-            throw new AppError("Selected template has invalid width",400);
-        }
-
-        if (!Number.isFinite(Number(template.height)) ||Number(template.height) <= 0) {
-            throw new AppError("Selected template has invalid height",400);
-        }
-
-        if (!Number.isFinite(Number(template.pitch_x)) ||Number(template.pitch_x) <= 0) {
-            throw new AppError("Selected template has invalid pitch_x",400);
-        }
-
-        if (!Number.isFinite(Number(template.pitch_y)) ||Number(template.pitch_y) <= 0) {
-            throw new AppError("Selected template has invalid pitch_y", 400);
-        }
-
-        try {
-            template.elements = typeof template.elements === "string"? JSON.parse(template.elements) : template.elements;
-
-            if (!Array.isArray(template.elements)
-            ) {
-            throw new Error("elements must be an array");
-            }
-        } catch {
-            throw new AppError("Selected product QR template has invalid elements configuration", 400);
-        }
-
-        
-
-        // ------------------------------------------------------
-        // 8.1 Create bucket
-        // ------------------------------------------------------
-
-        const [bucketResult] =
-            await conn.query(
-            `
-            INSERT INTO production_qr_buckets
-            (
-                product_id,
-                current_year,
-                current_week,
-                start_serial,
-                end_serial,
-                generated_qty,
-                printed_qty,
-                status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, 0, 'GENERATED')
-            `,
-            [
-                product.id,
-                year,
-                week,
-                startSerial,
-                endSerial,
-                quantity,
-            ]
-            );
-
-        const bucketId = bucketResult.insertId;
-
-        // ------------------------------------------------------
-        // 9. Generate QR inventory
-        // ------------------------------------------------------
-
-        // const generationDate = new Date();
-        const qrRows = [];
-
-        for (let i = 0; i < previewQrData.length; i++) {
-        const qrData = previewQrData[i];
-
-        qrRows.push([
-            bucketId,
-            product.id,
-            qrData,
-            qrData,
-            "GENERATED",
-        ]);
-        }
-
-        // ------------------------------------------------------
-        // 10. Insert in chunks
-        // ------------------------------------------------------
-
-        for (let i = 0; i < qrRows.length; i += CHUNK_SIZE) {
-        const batch = qrRows.slice(i, i + CHUNK_SIZE);
+    if (
+        Number(
+        ruleRecord.current_year
+        ) !== year ||
+        Number(
+        ruleRecord.current_week
+        ) !== week
+    ) {
+        nextSerial = 1;
 
         await conn.query(
-            `
-            INSERT INTO production_qr_codes
-            (
-            bucket_id,
+        `
+        UPDATE production_serial_rules
+        SET
+            current_year = ?,
+            current_week = ?,
+            next_serial = 1,
+            updated_at = NOW()
+        WHERE id = ?
+        `,
+        [
+            year,
+            week,
+            id,
+        ]
+        );
+    }
+
+    // ------------------------------------------------------
+    // 4. Weekly range validation
+    // ------------------------------------------------------
+
+    const maxSerial =
+        10 ** width - 1;
+
+    const startSerial =
+        nextSerial;
+
+    const endSerial =
+        startSerial +
+        quantity -
+        1;
+
+    if (
+        endSerial >
+        maxSerial
+    ) {
+        const remaining =
+        Math.max(
+            maxSerial -
+            startSerial +
+            1,
+            0
+        );
+
+        throw new AppError(
+        `Requested quantity exceeds the available range for this week. Only ${remaining} serials remain.`,
+        409
+        );
+    }
+
+    // ------------------------------------------------------
+    // 5. Prevent collision with previously generated
+    //    physical QR identities.
+    // ------------------------------------------------------
+
+    const generationDate = new Date();
+    const previewQrData = [];
+
+    for (let serial = startSerial; serial <= endSerial; serial++) {
+    const qrData = buildQrData({
+        rule,
+        product,
+        serial,
+        date: generationDate,
+    });
+
+    if (!qrData) {
+        throw new AppError(
+        `Failed to generate QR data for serial ${String(serial).padStart(width, "0")}`,
+        500
+        );
+    }
+
+    previewQrData.push(qrData);
+    }
+
+    const [collisionRows] = await conn.query(
+    `
+    SELECT serial_no
+    FROM production_qr_codes
+    WHERE product_id = ?
+        AND serial_no IN (?)
+    LIMIT 1
+    `,
+    [product.id, previewQrData]
+    );
+
+    if (collisionRows.length) {
+    throw new AppError(
+        `QR identity already exists: ${collisionRows[0].serial_no}`,
+        409
+    );
+    }
+
+    // ------------------------------------------------------
+    // 6. Validate printer
+    // ------------------------------------------------------
+
+    const [printerRows] =
+        await conn.query(
+        `
+        SELECT
+            id,
+            name,
+            printer_name,
+            is_active
+
+        FROM printers
+
+        WHERE id = ?
+            AND is_active = 1
+
+        LIMIT 1
+        `,
+        [printerId]
+        );
+
+    if (!printerRows.length) {
+        throw new AppError(
+        "Selected printer not found or inactive",
+        404
+        );
+    }
+
+    const printer =
+        printerRows[0];
+
+    if (!printer.printer_name) {
+        throw new AppError(
+        "Selected printer is missing printer_name",
+        400
+        );
+    }
+
+    // ------------------------------------------------------
+    // 7. Validate Product QR template
+    // ------------------------------------------------------
+
+    const [templateRows] =
+        await conn.query(
+        `
+        SELECT
+            id,
+            name,
+            template_type,
+            dpi,
+            width,
+            height,
+            pitch_x,
+            pitch_y,
+            elements,
+            is_active
+
+        FROM label_templates
+
+        WHERE id = ?
+            AND template_type = 'PRODUCT_QR'
+            AND is_active = 1
+
+        LIMIT 1
+        `,
+        [templateId]
+        );
+
+    if (!templateRows.length) {
+        throw new AppError(
+        "Selected product QR template not found or inactive",
+        404
+        );
+    }
+
+    const template = templateRows[0];
+
+    if (!Number.isFinite(Number(template.width)) ||Number(template.width) <= 0) {
+        throw new AppError("Selected template has invalid width",400);
+    }
+
+    if (!Number.isFinite(Number(template.height)) ||Number(template.height) <= 0) {
+        throw new AppError("Selected template has invalid height",400);
+    }
+
+    if (!Number.isFinite(Number(template.pitch_x)) ||Number(template.pitch_x) <= 0) {
+        throw new AppError("Selected template has invalid pitch_x",400);
+    }
+
+    if (!Number.isFinite(Number(template.pitch_y)) ||Number(template.pitch_y) <= 0) {
+        throw new AppError("Selected template has invalid pitch_y", 400);
+    }
+
+    try {
+        template.elements = typeof template.elements === "string"? JSON.parse(template.elements) : template.elements;
+
+        if (!Array.isArray(template.elements)
+        ) {
+        throw new Error("elements must be an array");
+        }
+    } catch {
+        throw new AppError("Selected product QR template has invalid elements configuration", 400);
+    }
+
+    
+
+    // ------------------------------------------------------
+    // 8.1 Create bucket
+    // ------------------------------------------------------
+
+    const [bucketResult] =
+        await conn.query(
+        `
+        INSERT INTO production_qr_buckets
+        (
             product_id,
+            current_year,
+            current_week,
+            start_serial,
+            end_serial,
+            generated_qty,
+            printed_qty,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 0, 'GENERATED')
+        `,
+        [
+            product.id,
+            year,
+            week,
+            startSerial,
+            endSerial,
+            quantity,
+        ]
+        );
+
+    const bucketId = bucketResult.insertId;
+
+    // ------------------------------------------------------
+    // 9. Generate QR inventory
+    // ------------------------------------------------------
+
+    // const generationDate = new Date();
+    const qrRows = [];
+
+    for (let i = 0; i < previewQrData.length; i++) {
+    const qrData = previewQrData[i];
+
+    qrRows.push([
+        bucketId,
+        product.id,
+        qrData,
+        qrData,
+        "GENERATED",
+    ]);
+    }
+
+    // ------------------------------------------------------
+    // 10. Insert in chunks
+    // ------------------------------------------------------
+
+    for (let i = 0; i < qrRows.length; i += CHUNK_SIZE) {
+    const batch = qrRows.slice(i, i + CHUNK_SIZE);
+
+    await conn.query(
+        `
+        INSERT INTO production_qr_codes
+        (
+        bucket_id,
+        product_id,
+        serial_no,
+        qr_data,
+        status
+        )
+        VALUES ?
+        `,
+        [batch]
+    );
+    }
+
+    // ------------------------------------------------------
+    // 11. Advance rule counter
+    // ------------------------------------------------------
+
+    await conn.query(
+        `
+        UPDATE production_serial_rules
+        SET
+        current_year = ?,
+        current_week = ?,
+        next_serial = ?,
+        updated_at = NOW()
+        WHERE id = ?
+        `,
+        [year, week, endSerial + 1, id]
+    );
+
+    // ------------------------------------------------------
+    // 12. Get generated records
+    // ------------------------------------------------------
+
+    const [generatedRows] =
+        await conn.query(
+        `
+        SELECT
+            id,
             serial_no,
             qr_data,
             status
-            )
-            VALUES ?
-            `,
-            [batch]
-        );
-        }
 
-        // ------------------------------------------------------
-        // 11. Advance rule counter
-        // ------------------------------------------------------
-
-        await conn.query(
-            `
-            UPDATE production_serial_rules
-            SET
-            current_year = ?,
-            current_week = ?,
-            next_serial = ?,
-            updated_at = NOW()
-            WHERE id = ?
-            `,
-            [year, week, endSerial + 1, id]
+        FROM production_qr_codes
+        WHERE bucket_id = ?
+        ORDER BY id ASC
+        `,
+        [bucketId]
         );
 
-        // ------------------------------------------------------
-        // 12. Get generated records
-        // ------------------------------------------------------
+    if (generatedRows.length !== quantity) {
+        throw new AppError("Generated QR record count does not match requested quantity", 500);
+    }
 
-        const [generatedRows] =
-            await conn.query(
-            `
-            SELECT
-                id,
-                serial_no,
-                qr_data,
-                status
+    // ------------------------------------------------------
+    // 13. Build Product QR label data
+    // ------------------------------------------------------
 
-            FROM production_qr_codes
-            WHERE bucket_id = ?
-            ORDER BY id ASC
-            `,
-            [bucketId]
-            );
+    const labels =
+        generatedRows.map(
+        (row) => ({
+            serial_no:row.serial_no,
+            qr_data:row.qr_data,
+            product_name:product.name || "",
+            part_code:product.part_code || "",
+            erp_no:product.erp_no || "",
+        })
+        );
 
-        if (generatedRows.length !== quantity) {
-            throw new AppError("Generated QR record count does not match requested quantity", 500);
-        }
+    // ------------------------------------------------------
+    // 14. Build ZPL
+    // ------------------------------------------------------
 
-        // ------------------------------------------------------
-        // 13. Build Product QR label data
-        // ------------------------------------------------------
+    const zpl = buildProductQrBatchZpl(template, labels);
 
-        const labels =
-            generatedRows.map(
-            (row) => ({
-                serial_no:row.serial_no,
-                qr_data:row.qr_data,
-                product_name:product.name || "",
-                part_code:product.part_code || "",
-                erp_no:product.erp_no || "",
-            })
-            );
+    if (!zpl) {
+        throw new AppError("Failed to generate Product QR ZPL", 500);
+    }
 
-        // ------------------------------------------------------
-        // 14. Build ZPL
-        // ------------------------------------------------------
+    // ------------------------------------------------------
+    // 15. Commit
+    // ------------------------------------------------------
 
-        const zpl = buildProductQrBatchZpl(template, labels);
+    await conn.commit();
 
-        if (!zpl) {
-            throw new AppError("Failed to generate Product QR ZPL", 500);
-        }
+    // ------------------------------------------------------
+    // 16. Response
+    // ------------------------------------------------------
 
-        // ------------------------------------------------------
-        // 15. Commit
-        // ------------------------------------------------------
+    return res.status(201).json({
+        data: {
+            bucket_id: bucketId,
+            product_id: product.id,
+            product_name: product.name,
 
-        await conn.commit();
+            printer_id: printer.id,
+            printer_name: printer.printer_name,
 
-        // ------------------------------------------------------
-        // 16. Response
-        // ------------------------------------------------------
+            template_id: template.id,
+            template_name: template.name,
 
-        return res.status(201).json({
-            data: {
-                bucket_id: bucketId,
-                product_id: product.id,
-                product_name: product.name,
+            year,
+            week,
 
-                printer_id: printer.id,
-                printer_name: printer.printer_name,
+            from: startSerial,
+            to: endSerial,
 
-                template_id: template.id,
-                template_name: template.name,
+            quantity,
 
-                year,
-                week,
+            qrCodes: generatedRows,
 
-                from: startSerial,
-                to: endSerial,
-
-                quantity,
-
-                qrCodes: generatedRows,
-
-                zpl,
-            },
-        });
-
-        } catch (error) {
-        try {
-            await conn.rollback();
-        } catch (rollbackError) {
-            console.error(
-            "Production QR rollback failed:",
-            rollbackError.message
-            );
-        }
-
-        throw error;
-        } finally {
-        conn.release();
-        }
+            zpl,
+        },
     });
+
+    } catch (error) {
+    try {
+        await conn.rollback();
+    } catch (rollbackError) {
+        console.error(
+        "Production QR rollback failed:",
+        rollbackError.message
+        );
+    }
+
+    throw error;
+    } finally {
+    conn.release();
+    }
+});
 
 // ------------------------------------------------------------
 // POST /qr-codes/mark-printed

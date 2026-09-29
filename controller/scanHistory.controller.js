@@ -291,7 +291,7 @@ const validateScanSequence = async (conn,{ scanned_value, stage_id, product_id, 
         psf.is_external_dependency,
         psf.external_source_type,
         psf.external_machine_type,
-        psf.machine_code,
+        S.machine_code,
         s.name AS stage_name
 
       FROM product_stage_flow psf
@@ -772,19 +772,17 @@ const handleSingleScan = async (conn, res, ctx) => {
   }
 };
 
-const checkExternalDependency = async (conn,
-  {
-    stage_name,
-    external_source_type,
-    external_machine_type,
-    machine_code,
-    scanned_value,
-  }
-) => {
-
+const checkExternalDependency = async (conn,{external_source_type, external_machine_type, machine_code, scanned_value}) => {
   // Skip if this stage doesn't use a local machine result
   if (external_source_type !== "LOCAL_FILE") {
     return { ok: true };
+  }
+
+  if (!machine_code) {
+    return {
+      ok: false,
+      message: `${external_machine_type || "External"} machine is not configured for this stage. Contact admin.`,
+    };
   }
 
 
@@ -2318,12 +2316,14 @@ const handleCustomerBinding = async (conn, res, ctx) => {
   }
 };
 
+// Keep your existing imports for pool, resolveCustomerQr, checkProductStatus,
+// validateScanSequence, checkExternalDependency and the handle*Scan functions.
+
 export const submitScan = async (req, res) => {
   const conn = await pool.getConnection();
 
   try {
     const { scanned_value, customer_qr, product_id } = req.body;
-
     const userId = req?.user?.id;
 
     let productionSerial = scanned_value;
@@ -2331,7 +2331,6 @@ export const submitScan = async (req, res) => {
     let customerBinding = null;
     let customerResolution = null;
     let isCustomerQrScan = false;
-
 
     // ============================================================
     // 1. Basic Request Validation
@@ -2357,11 +2356,7 @@ export const submitScan = async (req, res) => {
 
     const [userRows] = await conn.query(
       `
-      SELECT
-        id,
-        factory_id,
-        line_id,
-        stage_id
+      SELECT id, factory_id, line_id, stage_id
       FROM users
       WHERE id = ?
       `,
@@ -2375,11 +2370,7 @@ export const submitScan = async (req, res) => {
       });
     }
 
-    const {
-      factory_id,
-      line_id,
-      stage_id,
-    } = userRows[0];
+    const { factory_id, line_id, stage_id } = userRows[0];
 
     if (!stage_id) {
       return res.status(400).json({
@@ -2403,10 +2394,15 @@ export const submitScan = async (req, res) => {
       [product_id]
     );
 
-    const bindingSequence = bindingStageRows.length? Number(bindingStageRows[0].sequence_no) : null;
+    const bindingSequence = bindingStageRows.length
+      ? Number(bindingStageRows[0].sequence_no)
+      : null;
 
     // ============================================================
     // 4. Get Current Stage Flow
+    //
+    // machine_code belongs to the STAGE (stages.machine_code), so it
+    // is shared by every product that uses this stage.
     // ============================================================
 
     const [flowRows] = await conn.query(
@@ -2419,9 +2415,9 @@ export const submitScan = async (req, res) => {
         psf.external_source,
         psf.external_source_type,
         psf.external_machine_type,
-        psf.machine_code,
 
         s.name AS stage_name,
+        s.machine_code,
 
         /* Packaging configuration */
         pc.id AS packaging_config_id,
@@ -2486,27 +2482,22 @@ export const submitScan = async (req, res) => {
       printer_name,
     } = flowRows[0];
 
-
     // ============================================================
     // 5. Determine Scan Identity
     //
-    // BEFORE CUSTOMER_BINDING:
-    //     Product QR expected
-    //
-    // CUSTOMER_BINDING:
-    //     Product QR expected
-    //
-    // AFTER CUSTOMER_BINDING:
-    //     Customer QR expected
-    //     Customer QR is resolved back to Product QR
+    // BEFORE CUSTOMER_BINDING: Product QR expected
+    // CUSTOMER_BINDING:        Product QR expected
+    // AFTER CUSTOMER_BINDING:  Customer QR expected, resolved back
+    //                          to the Product QR
     // ============================================================
 
-    const isAfterCustomerBinding = bindingSequence !== null && Number(currentSeq) > bindingSequence;
-    if (isAfterCustomerBinding) {
+    const isAfterCustomerBinding =
+      bindingSequence !== null && Number(currentSeq) > bindingSequence;
 
-      // ==========================================================
+    if (isAfterCustomerBinding) {
+      // ----------------------------------------------------------
       // Customer QR Scan
-      // ==========================================================
+      // ----------------------------------------------------------
 
       customerResolution = await resolveCustomerQr(conn, scanned_value);
 
@@ -2520,10 +2511,6 @@ export const submitScan = async (req, res) => {
 
       isCustomerQrScan = true;
 
-      // ----------------------------------------------------------
-      // Build normalized binding object
-      // ----------------------------------------------------------
-
       customerBinding = {
         binding_id: customerResolution.bindingId,
         customer_qr: customerResolution.customerQr,
@@ -2535,59 +2522,33 @@ export const submitScan = async (req, res) => {
         binding_stage_id: customerResolution.bindingStageId,
       };
 
-      // ----------------------------------------------------------
       // Resolve actual manufacturing identity
-      // ----------------------------------------------------------
+      productionSerial = customerResolution.productionSerial;
+      resolvedProductId = customerResolution.productId;
 
-      productionSerial =
-        customerResolution.productionSerial;
-
-      resolvedProductId =
-        customerResolution.productId;
-
-      // ----------------------------------------------------------
-      // Customer QR must belong to selected product
-      // ----------------------------------------------------------
-
-      if (
-        Number(customerResolution.productId) !==
-        Number(product_id)
-      ) {
+      // Customer QR must belong to the selected product
+      if (Number(customerResolution.productId) !== Number(product_id)) {
         return res.status(409).json({
           success: false,
           errorType: "CUSTOMER_QR_WRONG_PRODUCT",
-          message:
-            "This Customer QR is bound to a different product.",
+          message: "This Customer QR is bound to a different product.",
         });
       }
 
-      // ----------------------------------------------------------
-      // Customer QR must belong to same factory
-      // ----------------------------------------------------------
-
-      if (
-        Number(customerResolution.factoryId) !==
-        Number(factory_id)
-      ) {
+      // Customer QR must belong to the same factory
+      if (Number(customerResolution.factoryId) !== Number(factory_id)) {
         return res.status(409).json({
           success: false,
           errorType: "CUSTOMER_QR_FACTORY_MISMATCH",
-          message:
-            "This Customer QR belongs to a different factory.",
+          message: "This Customer QR belongs to a different factory.",
         });
       }
-
-
     } else {
-
-      // ==========================================================
+      // ----------------------------------------------------------
       // Product QR Scan
-      // ==========================================================
+      // ----------------------------------------------------------
 
-      const productStatus = await checkProductStatus(
-        conn,
-        scanned_value
-      );
+      const productStatus = await checkProductStatus(conn, scanned_value);
 
       if (!productStatus.ok) {
         return res.status(400).json(productStatus);
@@ -2611,11 +2572,12 @@ export const submitScan = async (req, res) => {
       production_serial: productionSerial,
 
       // Customer QR information
-      customer_qr: customerBinding?.customer_qr || (isCustomerQrScan ? scanned_value : customer_qr || null),
+      customer_qr:
+        customerBinding?.customer_qr ||
+        (isCustomerQrScan ? scanned_value : customer_qr || null),
 
       customer_binding_id: customerBinding?.binding_id || null,
 
-      // IMPORTANT:
       // For Customer QR scans this comes directly from the binding.
       production_order_id: customerBinding?.production_order_id || null,
       isCustomerQrScan,
@@ -2632,24 +2594,19 @@ export const submitScan = async (req, res) => {
       printer_name,
     };
 
-
     // ============================================================
     // 7. Validate Physical Stage Sequence
     //
-    // Use Product QR as the manufacturing identity.
+    // Product QR is the manufacturing identity.
     // ============================================================
 
     if (scan_mode !== "GROUP_SCAN") {
-
-      const validation = await validateScanSequence(
-        conn,
-        {
-          scanned_value: productionSerial,
-          stage_id,
-          product_id: resolvedProductId,
-          currentSeq,
-        }
-      );
+      const validation = await validateScanSequence(conn, {
+        scanned_value: productionSerial,
+        stage_id,
+        product_id: resolvedProductId,
+        currentSeq,
+      });
 
       if (!validation.ok) {
         return res.status(400).json({
@@ -2663,24 +2620,33 @@ export const submitScan = async (req, res) => {
 
     // ============================================================
     // 8. External Dependency Validation
+    //
+    // The stage's machine_code decides which machine's results
+    // are checked, regardless of product.
     // ============================================================
 
-    if (
-      scan_mode === "SINGLE" &&
-      is_external_dependency
-    ) {
-
-      const depCheck =
-        await checkExternalDependency(conn, {
-          stage_name,
-          external_source,
-          external_source_type,
-          external_machine_type,
-          machine_code,
-
-          // Always use Product QR internally
-          scanned_value: productionSerial,
+    if (scan_mode === "SINGLE" && is_external_dependency) {
+      // A flow row marked external needs a stage that owns a machine code.
+      // Fail with a clear message instead of a bind error / never-matching query.
+      if (external_source_type === "LOCAL_FILE" && !machine_code) {
+        return res.status(400).json({
+          success: false,
+          message: `${
+            external_machine_type || "External"
+          } machine is not configured for stage "${stage_name}". Contact admin.`,
         });
+      }
+
+      const depCheck = await checkExternalDependency(conn, {
+        stage_name,
+        external_source,
+        external_source_type,
+        external_machine_type,
+        machine_code,
+
+        // Always use Product QR internally
+        scanned_value: productionSerial,
+      });
 
       if (!depCheck.ok) {
         return res.status(400).json({
@@ -2695,34 +2661,17 @@ export const submitScan = async (req, res) => {
     // ============================================================
 
     switch (scan_mode) {
-
       case "SINGLE":
-        return await handleSingleScan(
-          conn,
-          res,
-          ctx
-        );
+        return await handleSingleScan(conn, res, ctx);
 
       case "GROUP_CREATE":
-        return await handleGroupCreate(
-          conn,
-          res,
-          ctx
-        );
+        return await handleGroupCreate(conn, res, ctx);
 
       case "GROUP_SCAN":
-        return await handleGroupScan(
-          conn,
-          res,
-          ctx
-        );
+        return await handleGroupScan(conn, res, ctx);
 
       case "CUSTOMER_BINDING":
-        return await handleCustomerBinding(
-          conn,
-          res,
-          ctx
-        );
+        return await handleCustomerBinding(conn, res, ctx);
 
       default:
         return res.status(400).json({
@@ -2730,21 +2679,14 @@ export const submitScan = async (req, res) => {
           message: "Invalid scan mode",
         });
     }
-
   } catch (error) {
-
-    console.log(
-      "ERR IN SUBMIT SCAN:",
-      error
-    );
+    console.log("ERR IN SUBMIT SCAN:", error);
 
     return res.status(500).json({
       success: false,
       message: error.message,
     });
-
   } finally {
-
     conn.release();
   }
 };

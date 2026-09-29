@@ -1,6 +1,8 @@
 import { pool } from "../DB/config/mysql.config.js";
 
-
+// machine_code lives on `stages` (created in Stage configuration, shared by
+// every product that uses the stage). This controller only READS it via
+// `s.machine_code` — it never generates or changes it.
 const FLOW_WITH_JOINS_SQL = `
   SELECT
     psf.id,
@@ -8,6 +10,7 @@ const FLOW_WITH_JOINS_SQL = `
     p.name AS product_name,
     psf.stage_id,
     s.name AS stage_name,
+    s.line_id,
     psf.sequence_no,
     psf.scan_mode,
     psf.is_external_dependency,
@@ -18,7 +21,7 @@ const FLOW_WITH_JOINS_SQL = `
     psf.external_poll_interval_minutes,
     psf.external_file_extensions,
     psf.external_api_config,
-    psf.machine_code,
+    s.machine_code,
     psf.created_at
   FROM product_stage_flow psf
   JOIN products p ON p.id = psf.product_id
@@ -26,31 +29,35 @@ const FLOW_WITH_JOINS_SQL = `
   WHERE psf.id = ?
 `;
 
-const generateMachineCode = async (machineType) => {
-  if (!machineType) return null;
+const httpError = (status, message) =>
+  Object.assign(new Error(message), { status });
 
-  const [rows] = await pool.query(
-    `SELECT machine_code FROM product_stage_flow
-     WHERE external_machine_type = ? AND machine_code IS NOT NULL
-     ORDER BY id DESC LIMIT 1`,
-    [machineType]
+/**
+ * machine_code is created in Stage configuration (stages controller), NOT here.
+ * A flow row can only be marked external if its stage already owns a machine
+ * code — the row then simply inherits that code through the stages join.
+ */
+const assertStageHasMachineCode = async (conn, stageId) => {
+  const [rows] = await conn.query(
+    `SELECT machine_code FROM stages WHERE id = ?`,
+    [stageId]
   );
-
-  let nextNum = 1;
-  if (rows.length && rows[0].machine_code) {
-    const match = String(rows[0].machine_code).match(/(\d+)$/);
-    if (match) nextNum = parseInt(match[1], 10) + 1;
+  if (!rows.length) throw httpError(404, "Stage not found");
+  if (!rows[0].machine_code) {
+    throw httpError(
+      400,
+      "This stage has no machine code. Set it up as a machine in Stage configuration first."
+    );
   }
-
-  return `${machineType}-${String(nextNum).padStart(4, "0")}`;
 };
 
 export const createProductStageFlow = async (req, res) => {
+  const connection = await pool.getConnection();
   try {
     const {
       product_id,
       stage_id,
-      sequence_no, // optional now — auto-assigned as next-in-line if omitted
+      sequence_no, // optional — auto-assigned as next-in-line if omitted
       scan_mode,
       is_external_dependency = 0,
       external_source = null,
@@ -62,38 +69,44 @@ export const createProductStageFlow = async (req, res) => {
       external_api_config = null,
     } = req.body;
 
+    await connection.beginTransaction();
+
+    if (is_external_dependency) {
+      await assertStageHasMachineCode(connection, stage_id);
+    }
+
     let finalSequenceNo = sequence_no;
     if (!finalSequenceNo) {
-      const [maxRows] = await pool.query(
+      const [maxRows] = await connection.query(
         `SELECT COALESCE(MAX(sequence_no), 0) AS maxSeq FROM product_stage_flow WHERE product_id = ?`,
         [product_id]
       );
       finalSequenceNo = maxRows[0].maxSeq + 1;
     }
 
-    const machine_code =
-      is_external_dependency && external_machine_type
-        ? await generateMachineCode(external_machine_type)
-        : null;
-
-    const [result] = await pool.query(
+    const [result] = await connection.query(
       `INSERT INTO product_stage_flow
       (product_id, stage_id, sequence_no, scan_mode, is_external_dependency,
        external_source, external_source_type, external_machine_type, external_folder_path,
-       external_poll_interval_minutes, external_file_extensions, external_api_config, machine_code)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       external_poll_interval_minutes, external_file_extensions, external_api_config)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         product_id, stage_id, finalSequenceNo, scan_mode, is_external_dependency,
         external_source, external_source_type, external_machine_type, external_folder_path,
-        external_poll_interval_minutes, external_file_extensions, external_api_config, machine_code,
+        external_poll_interval_minutes, external_file_extensions, external_api_config,
       ]
     );
 
+    await connection.commit();
+
     const [rows] = await pool.query(FLOW_WITH_JOINS_SQL, [result.insertId]);
+    connection.release();
     return res.status(201).json({ message: "Stage flow created successfully", data: rows[0] });
   } catch (error) {
+    await connection.rollback();
+    connection.release();
     console.log("ERR IN CREATE PRODUCT STAGE FLOW:", error);
-    return res.status(500).json({ message: error.message });
+    return res.status(error.status || 500).json({ message: error.message });
   }
 };
 
@@ -106,6 +119,7 @@ export const getProductStageFlows = async (req, res) => {
         p.name AS product_name,
         psf.stage_id,
         s.name AS stage_name,
+        s.line_id,
         psf.sequence_no,
         psf.scan_mode,
         psf.is_external_dependency,
@@ -116,7 +130,7 @@ export const getProductStageFlows = async (req, res) => {
         psf.external_poll_interval_minutes,
         psf.external_file_extensions,
         psf.external_api_config,
-        psf.machine_code
+        s.machine_code
       FROM product_stage_flow psf
       JOIN products p ON p.id = psf.product_id
       JOIN stages s ON s.id = psf.stage_id
@@ -143,8 +157,8 @@ export const getProductFlowByProductId = async (req, res) => {
         psf.stage_id,
         s.name AS stage_name,
         psf.sequence_no,
-        psf.scan_mode,        
-        psf.machine_code
+        psf.scan_mode,
+        s.machine_code
       FROM product_stage_flow psf
       JOIN stages s ON s.id = psf.stage_id
       WHERE psf.product_id = ?
@@ -183,7 +197,7 @@ export const updateProductStageFlow = async (req, res) => {
     await connection.beginTransaction();
 
     const [existingRows] = await connection.query(
-      `SELECT machine_code, product_id, sequence_no FROM product_stage_flow WHERE id = ? FOR UPDATE`,
+      `SELECT product_id, sequence_no FROM product_stage_flow WHERE id = ? FOR UPDATE`,
       [id]
     );
 
@@ -195,11 +209,14 @@ export const updateProductStageFlow = async (req, res) => {
 
     const existing = existingRows[0];
 
-    // sequence_no is never accepted from the client anymore — drag reorder
+    if (is_external_dependency) {
+      await assertStageHasMachineCode(connection, stage_id);
+    }
+
+    // sequence_no is never accepted from the client — drag reorder
     // (/reorder endpoint) is the only thing allowed to change it. Keep the
     // existing value, UNLESS the product itself is being changed, in which
-    // case the old position is meaningless — re-append to the new product's
-    // flow instead of carrying over a stale/colliding number.
+    // case re-append to the new product's flow.
     let sequence_no = existing.sequence_no;
     if (product_id && product_id !== existing.product_id) {
       const [maxRows] = await connection.query(
@@ -207,15 +224,6 @@ export const updateProductStageFlow = async (req, res) => {
         [product_id]
       );
       sequence_no = maxRows[0].maxSeq + 1;
-    }
-
-    // machine_code is generated once and then kept forever — editing other
-    // fields never regenerates it. The only exception: a row that was
-    // created as a non-external stage and only later gets marked external
-    // (with a machine type) gets its first code assigned here.
-    let machine_code = existing.machine_code;
-    if (!machine_code && is_external_dependency && external_machine_type) {
-      machine_code = await generateMachineCode(external_machine_type);
     }
 
     const [result] = await connection.query(
@@ -233,8 +241,7 @@ export const updateProductStageFlow = async (req, res) => {
         external_folder_path = ?,
         external_poll_interval_minutes = ?,
         external_file_extensions = ?,
-        external_api_config = ?,
-        machine_code = ?
+        external_api_config = ?
       WHERE id = ?
       `,
       [
@@ -250,7 +257,6 @@ export const updateProductStageFlow = async (req, res) => {
         external_poll_interval_minutes,
         external_file_extensions,
         external_api_config,
-        machine_code,
         id,
       ]
     );
@@ -274,7 +280,7 @@ export const updateProductStageFlow = async (req, res) => {
     await connection.rollback();
     connection.release();
     console.log("ERR IN UPDATE PRODUCT STAGE FLOW:", error);
-    return res.status(500).json({ message: error.message });
+    return res.status(error.status || 500).json({ message: error.message });
   }
 };
 
@@ -295,6 +301,8 @@ export const deleteProductStageFlow = async (req, res) => {
     }
     const { product_id, sequence_no } = rows[0];
 
+    // NOTE: the stage's machine_code is intentionally NOT touched — it belongs
+    // to the stage/line, not to this product's flow row.
     await connection.query(`DELETE FROM product_stage_flow WHERE id = ?`, [id]);
 
     // Shift every later stage in THIS product's flow down by one — no gaps left behind.
@@ -344,7 +352,7 @@ export const reorderProductStageFlow = async (req, res) => {
     const [rows] = await connection.query(
       `SELECT psf.id, psf.stage_id, s.name AS stage_name, psf.sequence_no,
               psf.scan_mode, psf.is_external_dependency, psf.external_source,
-              psf.external_machine_type, psf.machine_code
+              psf.external_machine_type, s.machine_code
        FROM product_stage_flow psf
        JOIN stages s ON s.id = psf.stage_id
        WHERE psf.product_id = ?
@@ -360,5 +368,3 @@ export const reorderProductStageFlow = async (req, res) => {
     return res.status(500).json({ message: error.message });
   }
 };
-
-
