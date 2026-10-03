@@ -148,3 +148,79 @@ export const getBoxPrintJobZpl = asyncHandler(async (req, res) => {
     },
   });
 });
+
+// controllers/print.controller.js
+export const getStagePrintConfig = async (req, res) => {
+  try {
+    const product_id = Number(req.query.product_id);
+    const stage_id = Number(req.query.stage_id);
+
+    if (!product_id || !stage_id) {
+      return res
+        .status(400)
+        .json({ success: false, message: "product_id and stage_id are required" });
+    }
+
+    // Same condition submitScan uses to decide isPackagingStage
+    const [rows] = await pool.query(
+      `
+      SELECT id, box_size, barcode_format
+      FROM packaging_config
+      WHERE product_id = ?
+        AND stage_id = ?
+        AND is_active = 1
+      LIMIT 1
+      `,
+      [product_id, stage_id]
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        supports_print: rows.length > 0,
+        box_size: rows[0]?.box_size ?? null,
+        barcode_format: rows[0]?.barcode_format ?? null,
+      },
+    });
+  } catch (err) {
+    console.error("stage-print-config error:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to load print config" });
+  }
+};
+
+// controllers/print.controller.js
+export const getRecentBoxPrintJobs = async (req, res) => {
+  try {
+    const product_id = Number(req.query.product_id);
+    const stage_id = Number(req.query.stage_id);
+    if (!product_id || !stage_id) {
+      return res.status(400).json({ success: false, message: "product_id and stage_id are required" });
+    }
+
+    const [rows] = await pool.query(
+      `
+      SELECT
+        bpj.id AS print_job_id,
+        bpj.status,
+        bpj.barcode_data,
+        b.box_code,
+        b.actual_quantity,
+        b.packed_at
+      FROM box_print_jobs bpj
+      JOIN boxes b ON b.id = bpj.box_id
+      WHERE b.product_id = ?
+        AND b.packaging_stage_id = ?
+      ORDER BY bpj.id DESC
+      LIMIT 10
+      `,
+      [product_id, stage_id]
+    );
+
+    return res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error("recent box print jobs error:", err);
+    return res.status(500).json({ success: false, message: "Failed to load recent labels" });
+  }
+};

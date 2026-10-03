@@ -5,7 +5,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
-import { updatePrintJobStatus, getBoxPrintJobZpl } from "../controller/print.controller.js";
+import { updatePrintJobStatus, getBoxPrintJobZpl, getStagePrintConfig, getRecentBoxPrintJobs } from "../controller/print.controller.js";
 
 const router = Router();
 
@@ -43,5 +43,9 @@ router.post("/sign", (req, res) => {
     return res.status(500).type("text/plain").send("QZ signing failed");
   }
 });
+
+
+router.get("/stage-print-config", getStagePrintConfig);
+router.get("/box-print-jobs/recent",  getRecentBoxPrintJobs);
 
 export default router;

@@ -164,11 +164,11 @@ export const getMachineByCode = async (req, res) => {
         machineName: cfg.external_source ?? null,
         machineType: cfg.external_machine_type ?? null,
 
-        lineId: stage.line_id,
-        lineCode: stage.line_code,
-        stageId: stage.stage_id,
-        stageName: stage.stage_name,
-        stationCode: null,
+        lineId:     stage.line_id,
+        lineCode:   stage.line_code,
+        stageId:    stage.stage_id,
+        stageName:  stage.stage_name,
+        stationCode:null,
 
         sourceType: cfg.external_source_type ?? null,
         watchFolder: cfg.external_folder_path ?? null,
