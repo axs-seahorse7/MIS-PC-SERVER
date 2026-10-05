@@ -449,23 +449,20 @@ export const createProductionOrder = async (req, res) => {
         `
         SELECT q.id, q.qr_data
         FROM production_qr_codes q
-               WHERE q.product_id = ?
+        WHERE q.product_id = ?
           AND q.status IN ('GENERATED', 'PRINTED')
-          AND NOT EXISTS (
-            SELECT 1 FROM production pr
-            WHERE pr.serial_no = q.qr_data
-          )
           AND NOT EXISTS (
             SELECT 1
             FROM production_order_items poi
-
             INNER JOIN production_orders po
               ON po.id = poi.production_order_id
             WHERE po.line_id = ?
               AND po.product_id = ?
               AND poi.serial_no = q.qr_data
           )
-        ORDER BY q.id ASC
+        ORDER BY
+          EXISTS (SELECT 1 FROM production pr WHERE pr.serial_no = q.qr_data) DESC,
+          q.id ASC
         LIMIT ?
         `,
         [productId, lineId, productId, quantity]
