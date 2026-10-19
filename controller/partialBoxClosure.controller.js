@@ -184,3 +184,57 @@ export const closePartialBox = asyncHandler(async (req, res) => {
     conn.release();
   }
 });
+
+
+export const getOpenPartialBoxes = asyncHandler(async (req, res) => {
+  const productId = Number(req.query.product_id);
+  const stageId = Number(req.query.stage_id);
+
+  if (
+    !Number.isSafeInteger(productId) ||
+    productId <= 0 ||
+    !Number.isSafeInteger(stageId) ||
+    stageId <= 0
+  ) {
+    throw new AppError(
+      "Valid product_id and stage_id are required",
+      400
+    );
+  }
+
+  const [rows] = await pool.query(
+    `SELECT
+       b.id AS box_id,
+       b.box_code,
+       b.barcode_data,
+       b.product_id,
+       b.packaging_stage_id AS stage_id,
+       b.actual_quantity,
+       b.box_size,
+       b.status,
+       p.name AS product_name,
+       s.name AS stage_name
+     FROM boxes b
+     INNER JOIN packaging_config pc
+       ON pc.product_id = b.product_id
+      AND pc.stage_id = b.packaging_stage_id
+      AND pc.is_active = 1
+      AND pc.allow_partial_close = 1
+     LEFT JOIN products p
+       ON p.id = b.product_id
+     LEFT JOIN stages s
+       ON s.id = b.packaging_stage_id
+     WHERE b.product_id = ?
+       AND b.packaging_stage_id = ?
+       AND b.status IN ('OPEN', 'PACKING')
+       AND b.actual_quantity > 0
+       AND b.actual_quantity < b.box_size
+     ORDER BY b.id DESC`,
+    [productId, stageId]
+  );
+
+  res.status(200).json({
+    success: true,
+    data: rows,
+  });
+});

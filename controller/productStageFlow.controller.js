@@ -245,6 +245,7 @@ export const getProductFlowByProductId = async (req, res) => {
       });
     }
 
+    
     const [result] = await pool.query(
       `
       SELECT
@@ -255,17 +256,33 @@ export const getProductFlowByProductId = async (req, res) => {
         s.name AS stage_name,
         psf.sequence_no,
         psf.scan_mode,
-        s.machine_code
+        s.machine_code,
+
+        pc.id AS packaging_config_id,
+        CASE
+          WHEN pc.id IS NOT NULL THEN TRUE
+          ELSE FALSE
+        END AS is_packaging_stage
+
       FROM product_stage_flow psf
+
       JOIN stages s
         ON s.id = psf.stage_id
-       AND s.line_id = psf.line_id
+      AND s.line_id = psf.line_id
+
+      LEFT JOIN packaging_config pc
+        ON pc.product_id = psf.product_id
+      AND pc.stage_id = psf.stage_id
+      AND pc.is_active = 1
+
       WHERE psf.product_id = ?
         AND psf.line_id = ?
+
       ORDER BY psf.sequence_no
       `,
       [Number(productId), Number(lineId)]
     );
+
 
     return res.status(200).json(result);
   } catch (error) {

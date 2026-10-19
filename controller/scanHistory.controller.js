@@ -2893,83 +2893,74 @@ export const createGroup = async (req, res) => {
 };
 
 
+
 export const getTenLatestScans = async (req, res) => {
   const conn = await pool.getConnection();
 
   try {
-
     const {
       factory_id,
       product_id,
       line_id,
       stage_id,
+      production_order_id,
     } = req.params;
 
     if (
       !factory_id ||
       !product_id ||
       !line_id ||
-      !stage_id
+      !stage_id ||
+      !production_order_id ||
+      production_order_id === "null"
     ) {
       return res.status(400).json({
         success: false,
         message:
-          "factory_id, product_id, line_id and stage_id are required.",
+          "factory_id, product_id, line_id, stage_id and a valid production_order_id are required.",
       });
     }
 
     const [rows] = await conn.query(
-      ` 
+      `
       SELECT
         sh.id,
         sh.scanned_value,
         sh.sequence_no,
         sh.status,
         sh.scanned_at,
-
         u.username AS scanned_by,
-
         p.name AS product_name,
-
         po.order_no AS production_order_no,
-
         s.name AS stage_name,
-
         cb.customer_qr
-
       FROM scan_history sh
-
       LEFT JOIN users u
         ON u.id = sh.user_id
-
       INNER JOIN production_orders po
         ON po.id = sh.production_order_id
-
       INNER JOIN products p
         ON p.id = po.product_id
-
       LEFT JOIN stages s
         ON s.id = sh.stage_id
-
       LEFT JOIN customer_bindings cb
         ON cb.pcb_qr = sh.scanned_value
-      AND cb.stage_id = sh.stage_id
-
+       AND cb.stage_id = sh.stage_id
       WHERE sh.factory_id = ?
+        AND sh.production_order_id = ?
         AND sh.line_id = ?
         AND sh.stage_id = ?
         AND po.product_id = ?
         AND sh.status = 'SUCCESS'
-
       ORDER BY sh.scanned_at DESC
-
       LIMIT 10
       `,
       [
-        factory_id,
-        line_id,
-        stage_id,
-        product_id,
+        Number(factory_id),
+        Number(production_order_id),
+        Number(line_id),
+        Number(stage_id),
+        Number(product_id),
       ]
     );
 
@@ -2977,21 +2968,14 @@ export const getTenLatestScans = async (req, res) => {
       success: true,
       data: rows,
     });
-
   } catch (error) {
-
-    console.error(
-      "ERR IN GET TEN LATEST SCANS:",
-      error
-    );
+    console.error("ERR IN GET TEN LATEST SCANS:", error);
 
     return res.status(500).json({
       success: false,
       message: error.message,
     });
-
   } finally {
     conn.release();
   }
 };
-
