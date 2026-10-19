@@ -11,6 +11,8 @@ export const validateProductionOrderSequence = async (
     customerQr = null,
   }
 ) => {
+
+
   const normalizedScannedValue = String(scannedValue || "").trim();
 
   if (!normalizedScannedValue) {
@@ -55,6 +57,8 @@ export const validateProductionOrderSequence = async (
   const scanIdentityType = isCustomerQrScan ? "CUSTOMER_QR" : "PRODUCT_QR";
   let customerBinding = null;
   let resolvedCustomerQr = customerQr ? String(customerQr).trim() : null;
+
+  
 
   // ============================================================
   // 2A. Customer QR
@@ -226,6 +230,7 @@ export const validateProductionOrderSequence = async (
         AND poi.serial_no = ?
         AND po.factory_id = ?
         AND po.product_id = ?
+        AND po.line_id = ?
 
       LIMIT 1
       `,
@@ -338,20 +343,24 @@ export const validateProductionOrderSequence = async (
   // 7. Current Product Stage
   // ============================================================
 
+  
   const [currentFlowRows] = await conn.query(
     `
     SELECT
       id,
       stage_id,
+      line_id,
       sequence_no,
       scan_mode
     FROM product_stage_flow
     WHERE product_id = ?
+      AND line_id = ?
       AND stage_id = ?
     LIMIT 1
     `,
-    [item.product_id, stageId]
+    [item.product_id, item.line_id, stageId]
   );
+
 
   if (!currentFlowRows.length) {
     return {
@@ -467,20 +476,24 @@ export const validateProductionOrderSequence = async (
 
   const previousSequence = currentSequence - 1;
 
+  
   const [previousStageRows] = await conn.query(
     `
     SELECT
       id,
       stage_id,
+      line_id,
       sequence_no,
       scan_mode
     FROM product_stage_flow
     WHERE product_id = ?
+      AND line_id = ?
       AND sequence_no = ?
     LIMIT 1
     `,
-    [item.product_id, previousSequence]
+    [item.product_id, item.line_id, previousSequence]
   );
+
 
   if (!previousStageRows.length) {
     return {
@@ -505,10 +518,11 @@ export const validateProductionOrderSequence = async (
       SELECT sequence_no
       FROM product_stage_flow
       WHERE product_id = ?
+        AND line_id = ?
         AND scan_mode = 'CUSTOMER_BINDING'
       LIMIT 1
       `,
-      [item.product_id]
+      [item.product_id, item.line_id]
     );
 
     const bindingSequence = bindingStageRows.length

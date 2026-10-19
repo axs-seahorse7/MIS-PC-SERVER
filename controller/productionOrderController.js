@@ -1,24 +1,6 @@
 import { pool } from "../DB/config/mysql.config.js";
 
-// ============================================================
-// PRODUCTION SERIAL RULE HELPERS
-// ============================================================
 
-
-// Add getReusableQr and replace createProductionOrder in your production order controller.
-// Route (must be registered BEFORE the "/:id" GET route, or "reusable-qr" is read as an id):
-//   router.get("/reusable-qr", <same auth middleware>, getReusableQr);
-
-// ------------------------------------------------------------------
-// Unused QR identities left over in CANCELLED orders of the same
-// product + line.
-//
-// "Unused" means the serial was never scanned anywhere (scan_history)
-// and never tested by a machine (ict_results — rename to machine_results
-// when you rename the table), and is not REJECTED. A machine result left
-// over from an earlier test would otherwise let a reused serial pass the
-// external check without being tested again.
-// ------------------------------------------------------------------
 const REUSABLE_ITEMS_SQL = `
   SELECT
     poi.id,
@@ -46,8 +28,265 @@ const REUSABLE_ITEMS_SQL = `
     )
 `;
 
-const httpError = (status, message) =>
-  Object.assign(new Error(message), { status });
+
+const getIsoYearWeek = (date) => {
+  const d = new Date(
+    Date.UTC(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate()
+    )
+  );
+
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+
+  const year = d.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(year, 0, 1));
+
+  const week = Math.ceil(
+    (((d - yearStart) / 86400000) + 1) / 7
+  );
+
+  return { year, week };
+};
+
+const getDatePart = (part, date) => {
+  const yyyy = String(date.getFullYear());
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+
+  switch (part) {
+    case "YYYY":
+      return yyyy;
+    case "YY":
+      return yyyy.slice(-2);
+    case "MM":
+      return mm;
+    case "DD":
+      return dd;
+    case "WW":
+      return String(getIsoYearWeek(date).week).padStart(2, "0");
+    default:
+      throw new Error(`Unsupported date segment: ${part}`);
+  }
+};
+
+const getProductFieldValue = (field, product) => {
+  switch (field) {
+    case "name":
+      return product.name || "";
+    case "part_code":
+      return product.part_code || "";
+    case "erp_no":
+      return product.erp_no || "";
+    default:
+      throw new Error(`Unsupported product field: ${field}`);
+  }
+};
+
+const buildProductionSerial = ({ rule, product, serial, date }) => {
+  return rule.map((segment) => {
+    switch (segment.type) {
+      case "STATIC":
+        return String(segment.value ?? "");
+
+      case "PRODUCT_FIELD":
+        return getProductFieldValue(segment.field, product);
+
+      case "DATE":
+        return (segment.parts || [])
+          .map((part) => getDatePart(part, date))
+          .join("");
+
+      case "SERIAL":
+        return String(serial).padStart(Number(segment.width), "0");
+
+      default:
+        throw new Error(
+          `Unsupported production serial segment: ${segment.type}`
+        );
+    }
+  }).join("");
+};
+
+
+const allocateProductionSerials = async ({
+  connection,
+  product,
+  productId,
+  lineId,
+  rule,
+  serialWidth,
+  quantity,
+  plannedDate,
+  excludeOrderId = null,
+}) => {
+  
+  const dateParts = String(plannedDate).split("-").map(Number);
+
+  if (
+    dateParts.length !== 3 ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(String(plannedDate)) ||
+    dateParts.some((part) => !Number.isInteger(part))
+  ) {
+    throw new Error("Invalid production order planned date");
+  }
+
+  const [year, month, day] = dateParts;
+  const date = new Date(year, month - 1, day);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    throw new Error("Invalid production order planned date");
+  }
+
+
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    throw new Error("Quantity must be a positive integer");
+  }
+
+  if (
+    !Number.isInteger(serialWidth) ||
+    serialWidth < 1 ||
+    serialWidth > 5
+  ) {
+    throw new Error("Invalid serial width");
+  }
+
+  const maxSerial = (10 ** serialWidth) - 1;
+
+  if (quantity > maxSerial) {
+    throw new Error(
+      `Quantity exceeds serial capacity. Maximum: ${maxSerial}`
+    );
+  }
+
+  // Ensure one counter exists for this product + line.
+  await connection.query(
+    `
+    INSERT IGNORE INTO production_order_serial_counters
+      (product_id, line_id, next_serial)
+    VALUES (?, ?, 1)
+    `,
+    [productId, lineId]
+  );
+
+  // Lock the counter within the current transaction.
+  const [counterRows] = await connection.query(
+    `
+    SELECT next_serial
+    FROM production_order_serial_counters
+    WHERE product_id = ?
+      AND line_id = ?
+    FOR UPDATE
+    `,
+    [productId, lineId]
+  );
+
+  if (!counterRows.length) {
+    throw new Error("Unable to lock the production serial counter");
+  }
+
+  let candidate = Number(counterRows[0].next_serial);
+
+  if (
+    !Number.isInteger(candidate) ||
+    candidate < 1 ||
+    candidate > maxSerial
+  ) {
+    candidate = 1;
+  }
+
+  const allocated = [];
+  const allocatedSet = new Set();
+  let attempts = 0;
+
+  while (allocated.length < quantity && attempts < maxSerial) {
+    const serialNo = buildProductionSerial({
+      rule,
+      product,
+      serial: candidate,
+      date,
+    });
+
+    if (!allocatedSet.has(serialNo)) {
+      
+      const [existingRows] = await connection.query(
+        `
+        SELECT 1
+        FROM production_order_items poi
+        INNER JOIN production_orders po
+          ON po.id = poi.production_order_id
+        WHERE po.product_id = ?
+          AND po.line_id = ?
+          AND (? IS NULL OR po.id <> ?)
+          AND poi.serial_no = ?
+        LIMIT 1
+        `,
+        [
+          productId,
+          lineId,
+          excludeOrderId,
+          excludeOrderId,
+          serialNo,
+        ]
+      );
+
+
+      const [productionRows] = await connection.query(
+        `
+        SELECT 1
+        FROM production
+        WHERE product_id = ?
+          AND line_id = ?
+          AND serial_no = ?
+        LIMIT 1
+        `,
+        [productId, lineId, serialNo]
+      );
+
+      if (!existingRows.length && !productionRows.length) {
+        allocated.push({
+          serial_no: serialNo,
+          serial_value: candidate,
+        });
+
+        allocatedSet.add(serialNo);
+      }
+    }
+
+    candidate = candidate >= maxSerial ? 1 : candidate + 1;
+    attempts += 1;
+  }
+
+  if (allocated.length !== quantity) {
+    throw new Error(
+      `Not enough unused serials for this product and line. ` +
+      `Requested: ${quantity}, available: ${allocated.length}, ` +
+      `serial capacity: ${maxSerial}`
+    );
+  }
+
+  await connection.query(
+    `
+    UPDATE production_order_serial_counters
+    SET next_serial = ?
+    WHERE product_id = ?
+      AND line_id = ?
+    `,
+    [candidate, productId, lineId]
+  );
+
+  return allocated;
+};
+
+
+
+const httpError = (status, message) => Object.assign(new Error(message), { status });
 
 // ------------------------------------------------------------------
 // GET /production-orders/reusable-qr?productId=&lineId=
@@ -138,9 +377,6 @@ export const createProductionOrder = async (req, res) => {
       targetQty,
       sequenceMode = "NON_SEQUENTIAL",
       plannedDate,
-      // "NEW"       -> next unassigned QR identities (default, old behaviour)
-      // "CANCELLED" -> unused QR identities left in cancelled orders
-      qrSource = "NEW",
     } = req.body;
 
     // ============================================================
@@ -198,14 +434,31 @@ export const createProductionOrder = async (req, res) => {
       });
     }
 
-    if (!["NEW", "CANCELLED"].includes(qrSource)) {
-      return res.status(400).json({
-        message: "qrSource must be NEW or CANCELLED",
-      });
-    }
 
     const quantity = Number(targetQty);
 
+    
+    if (plannedDate) {
+      const validFormat = /^\d{4}-\d{2}-\d{2}$/.test(plannedDate);
+
+      if (!validFormat) {
+        return res.status(400).json({
+          message: "Planned Date must be a valid YYYY-MM-DD date",
+        });
+      }
+
+      const [year, month, day] = plannedDate.split("-").map(Number);
+      const dateCheck = new Date(year, month - 1, day);
+
+      if (dateCheck.getFullYear() !== year || dateCheck.getMonth() !== month - 1 || dateCheck.getDate() !== day) {
+        return res.status(400).json({
+          message: "Planned Date must be a valid YYYY-MM-DD date",
+        });
+      }
+    }
+
+
+    
     // ============================================================
     // START TRANSACTION
     // ============================================================
@@ -287,17 +540,16 @@ export const createProductionOrder = async (req, res) => {
         psf.stage_id,
         psf.sequence_no
       FROM product_stage_flow psf
-
       INNER JOIN stages s
         ON s.id = psf.stage_id
-
+      AND s.line_id = psf.line_id
       WHERE psf.product_id = ?
+        AND psf.line_id = ?
         AND s.factory_id = ?
         AND s.is_active = 1
-
       ORDER BY psf.sequence_no ASC
       `,
-      [productId, factoryId]
+      [productId, lineId, factoryId]
     );
 
     if (!stageFlowRows.length) {
@@ -389,90 +641,25 @@ export const createProductionOrder = async (req, res) => {
     }
 
     // ============================================================
-    // SELECT QR IDENTITIES
-    //
-    // Rule: the same QR on different lines is allowed, the same QR
-    // twice on the same line is not.
+    // ============================================================
+    // GENERATE SERIALS DIRECTLY FROM THE PRODUCT SERIAL RULE
     // ============================================================
 
-    let selectedQr = []; // [{ qr_data }]
-    let oldItemIds = []; // items moved out of cancelled orders
-    let reusedFromOrders = [];
+    const now = new Date();
 
-    if (qrSource === "CANCELLED") {
-      // ----------------------------------------------------------
-      // Reuse unused identities from cancelled orders (same product
-      // + same line), oldest cancelled order first.
-      // ----------------------------------------------------------
+    const effectivePlannedDate = plannedDate ||
+      `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 
-      const [reusableRows] = await connection.query(
-        `${REUSABLE_ITEMS_SQL}
-         ORDER BY po.id ASC, poi.id ASC
-         LIMIT ?
-         FOR UPDATE`,
-        [productId, lineId, quantity]
-      );
-
-      if (reusableRows.length < quantity) {
-        throw httpError(
-          409,
-          `Only ${reusableRows.length} unused Product QR identities are available from cancelled orders. Required: ${quantity}`
-        );
-      }
-
-      selectedQr = reusableRows.map((row) => ({ qr_data: row.serial_no }));
-      oldItemIds = reusableRows.map((row) => row.id);
-
-      const counts = new Map();
-
-      reusableRows.forEach((row) => {
-        counts.set(row.order_no, (counts.get(row.order_no) || 0) + 1);
-      });
-
-      reusedFromOrders = Array.from(counts, ([orderNo, count]) => ({
-        orderNo,
-        count,
-      }));
-    } else {
-      // ----------------------------------------------------------
-      // Next generated QR identities not yet assigned on this line.
-      // Leftovers in cancelled orders are still assigned to those
-      // orders on this line, so they are skipped here and stay
-      // available for reuse.
-      // ----------------------------------------------------------
-
-      const [candidateQrRows] = await connection.query(
-        `
-        SELECT q.id, q.qr_data
-        FROM production_qr_codes q
-        WHERE q.product_id = ?
-          AND q.status IN ('GENERATED', 'PRINTED')
-          AND NOT EXISTS (
-            SELECT 1
-            FROM production_order_items poi
-            INNER JOIN production_orders po
-              ON po.id = poi.production_order_id
-            WHERE po.line_id = ?
-              AND po.product_id = ?
-              AND poi.serial_no = q.qr_data
-          )
-        ORDER BY
-          EXISTS (SELECT 1 FROM production pr WHERE pr.serial_no = q.qr_data) DESC,
-          q.id ASC
-        LIMIT ?
-        `,
-        [productId, lineId, productId, quantity]
-      );
-
-      if (candidateQrRows.length < quantity) {
-        throw httpError(
-          409,
-          `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
-        );
-      }
-
-      selectedQr = candidateQrRows.map((row) => ({ qr_data: row.qr_data }));
-    }
+    const selectedQr = await allocateProductionSerials({
+      connection,
+      product,
+      productId: Number(productId),
+      lineId: Number(lineId),
+      rule,
+      serialWidth,
+      quantity,
+      plannedDate: effectivePlannedDate,
+    });
 
     // ============================================================
     // GENERATE PRODUCTION ORDER NUMBER
@@ -521,15 +708,16 @@ export const createProductionOrder = async (req, res) => {
     // ============================================================
 
     const firstQr = selectedQr[0];
+    const lastQr = selectedQr[selectedQr.length - 1];
 
-    const serialStart = 1;
-    const serialEnd = quantity;
+    const serialStart = firstQr.serial_value;
+    const serialEnd = lastQr.serial_value;
 
     const serialPrefix =
-      firstQr.qr_data?.slice(
+      firstQr.serial_no.slice(
         0,
-        Math.max(0, firstQr.qr_data.length - serialWidth)
-      ) || "";
+        Math.max(0, firstQr.serial_no.length - serialWidth)
+      );
 
     // ============================================================
     // CREATE PRODUCTION ORDER
@@ -565,29 +753,13 @@ export const createProductionOrder = async (req, res) => {
         serialEnd,
         serialWidth,
         sequenceMode,
-        plannedDate || today,
+        effectivePlannedDate,
         req.user?.id || null,
       ]
     );
 
     const productionOrderId = orderResult.insertId;
 
-    // ============================================================
-    // MOVE REUSED ITEMS OUT OF THE CANCELLED ORDERS
-    //
-    // The cancelled order keeps only what it actually consumed;
-    // the rest now belongs to the new order.
-    // ============================================================
-
-    if (oldItemIds.length) {
-      await connection.query(
-        `
-        DELETE FROM production_order_items
-        WHERE id IN (?)
-        `,
-        [oldItemIds]
-      );
-    }
 
     // ============================================================
     // CREATE PRODUCTION ORDER ITEMS
@@ -597,7 +769,7 @@ export const createProductionOrder = async (req, res) => {
 
     const itemValues = selectedQr.map((qr, index) => [
       productionOrderId,
-      qr.qr_data,
+      qr.serial_no,
       index + 1,
       "ACTIVE",
     ]);
@@ -677,12 +849,10 @@ export const createProductionOrder = async (req, res) => {
 
         serialRuleId: serialRule.id,
 
-        qrSource,
-        reusedFromOrders,
 
         qrRange: {
-          from: selectedQr[0].qr_data,
-          to: selectedQr[quantity - 1].qr_data,
+          from: selectedQr[0].serial_no,
+          to: selectedQr[selectedQr.length - 1].serial_no,
         },
 
         sequenceMode,
@@ -715,12 +885,112 @@ export const createProductionOrder = async (req, res) => {
   }
 };
 
+// ------------------------------------------------------------------
+// Give serial numbers back after an order was edited to a smaller
+// quantity.
+//
+// The excess items are already deleted by the caller, so those serials
+// belong to no order any more. The counter still points past them though,
+// so the next order would skip them. When the released serials were the
+// most recently handed-out ones (counter = highest released + 1), move the
+// counter back to just after the highest serial that is still held by any
+// order or by production, so the next order continues from there.
+//
+// If another order was created after these serials were handed out, the
+// counter is left alone (moving it back could collide with that order).
+// ------------------------------------------------------------------
+const releaseSerialsToCounter = async (
+  conn,
+  { productId, lineId, serialWidth, releasedItems }
+) => {
+  const suffixes = releasedItems
+    .map((item) => Number(String(item.serial_no).slice(-serialWidth)))
+    .filter((value) => Number.isInteger(value));
+
+  if (!suffixes.length) return;
+
+  const maxReleased = Math.max(...suffixes);
+  const prefix = String(releasedItems[0].serial_no).slice(0, -serialWidth);
+  const serialLength = prefix.length + serialWidth;
+
+  await conn.query(
+    `
+    INSERT IGNORE INTO production_order_serial_counters
+      (product_id, line_id, next_serial)
+    VALUES (?, ?, 1)
+    `,
+    [productId, lineId]
+  );
+
+  const [counterRows] = await conn.query(
+    `
+    SELECT next_serial
+    FROM production_order_serial_counters
+    WHERE product_id = ? AND line_id = ?
+    FOR UPDATE
+    `,
+    [productId, lineId]
+  );
+
+  if (!counterRows.length) return;
+
+  const counter = Number(counterRows[0].next_serial);
+
+  // Something was allocated after these serials, so they are not the tail.
+  if (counter !== maxReleased + 1) return;
+
+  // Highest serial (same prefix = same date/week format) still in use.
+  const [heldRows] = await conn.query(
+    `
+    SELECT COALESCE(MAX(held.n), 0) AS max_held
+    FROM (
+      SELECT CAST(RIGHT(poi.serial_no, ?) AS UNSIGNED) AS n
+      FROM production_order_items poi
+      INNER JOIN production_orders po
+        ON po.id = poi.production_order_id
+      WHERE po.product_id = ?
+        AND po.line_id = ?
+        AND CHAR_LENGTH(poi.serial_no) = ?
+        AND LEFT(poi.serial_no, ?) = ?
+
+      UNION ALL
+
+      SELECT CAST(RIGHT(pr.serial_no, ?) AS UNSIGNED) AS n
+      FROM production pr
+      WHERE pr.product_id = ?
+        AND pr.line_id = ?
+        AND CHAR_LENGTH(pr.serial_no) = ?
+        AND LEFT(pr.serial_no, ?) = ?
+    ) held
+    `,
+    [
+      serialWidth, productId, lineId, serialLength, prefix.length, prefix,
+      serialWidth, productId, lineId, serialLength, prefix.length, prefix,
+    ]
+  );
+
+  const nextSerial = Number(heldRows[0].max_held) + 1;
+
+  if (nextSerial < counter) {
+    await conn.query(
+      `
+      UPDATE production_order_serial_counters
+      SET next_serial = ?
+      WHERE product_id = ? AND line_id = ?
+      `,
+      [nextSerial, productId, lineId]
+    );
+  }
+};
+
 export const updateProductionOrder = async (req, res) => {
-  const connection = await pool.getConnection();
+  let connection;
+  let transactionStarted = false;
 
   try {
-    const { id } = req.params;
+    connection = await pool.getConnection();
 
+    const { id } = req.params;
     const {
       productId,
       lineId,
@@ -729,44 +999,78 @@ export const updateProductionOrder = async (req, res) => {
       plannedDate,
     } = req.body;
 
-    // ============================================================
-    // BASIC VALIDATION
-    // ============================================================
+    // 1. Validate request
+    const orderId = Number(id);
+    const selectedProductId = Number(productId);
+    const selectedLineId = Number(lineId);
+    const quantity = Number(targetQty);
 
-    if (!productId) {
-      return res.status(400).json({ message: "Product is required" });
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+      return res.status(400).json({
+        message: "Invalid production order ID",
+      });
     }
 
-    if (!lineId) {
-      return res.status(400).json({ message: "Production line is required" });
+    if (!Number.isInteger(selectedProductId) || selectedProductId <= 0) {
+      return res.status(400).json({
+        message: "Valid product is required",
+      });
     }
 
-    if (!targetQty || Number(targetQty) <= 0) {
-      return res.status(400).json({ message: "Valid target quantity is required" });
+    if (!Number.isInteger(selectedLineId) || selectedLineId <= 0) {
+      return res.status(400).json({
+        message: "Valid production line is required",
+      });
     }
 
-    if (!Number.isInteger(Number(targetQty))) {
-      return res.status(400).json({ message: "Target quantity must be a whole number" });
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return res.status(400).json({
+        message: "Target quantity must be a positive whole number",
+      });
     }
 
     if (!["SEQUENTIAL", "NON_SEQUENTIAL"].includes(sequenceMode)) {
       return res.status(400).json({
-        message: "sequenceMode must be SEQUENTIAL or NON_SEQUENTIAL",
+        message: "Invalid sequence mode",
       });
     }
 
-    const quantity = Number(targetQty);
+    const isValidDate = (value) => {
+      if (
+        typeof value !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(value)
+      ) {
+        return false;
+      }
 
-    // ============================================================
-    // GET USER FACTORY
-    // ============================================================
+      const [year, month, day] = value.split("-").map(Number);
+      const date = new Date(year, month - 1, day);
 
+      return (
+        date.getFullYear() === year &&
+        date.getMonth() === month - 1 &&
+        date.getDate() === day
+      );
+    };
+
+    if (
+      plannedDate !== undefined &&
+      plannedDate !== null &&
+      plannedDate !== "" &&
+      !isValidDate(plannedDate)
+    ) {
+      return res.status(400).json({
+        message: "Planned date must be a valid YYYY-MM-DD date",
+      });
+    }
+
+    const now = new Date();
+    const today =
+      `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+    // 2. Validate user's factory
     const [userRows] = await connection.query(
-      `
-      SELECT factory_id
-      FROM users
-      WHERE id = ?
-      `,
+      `SELECT factory_id FROM users WHERE id = ?`,
       [req.user?.id || null]
     );
 
@@ -776,157 +1080,164 @@ export const updateProductionOrder = async (req, res) => {
       });
     }
 
-    const factoryId = userRows[0].factory_id;
+    const factoryId = Number(userRows[0].factory_id);
 
-    // ============================================================
-    // START TRANSACTION
-    // ============================================================
-
+    // 3. Lock the existing order
     await connection.beginTransaction();
-
-    // ============================================================
-    // LOCK EXISTING ORDER
-    // ============================================================
+    transactionStarted = true;
 
     const [existingRows] = await connection.query(
       `
       SELECT
         id,
+        factory_id,
+        product_id,
+        line_id,
         status,
-        product_id AS old_product_id,
-        line_id AS old_line_id
+        planned_date
       FROM production_orders
       WHERE id = ?
       FOR UPDATE
       `,
-      [id]
+      [orderId]
     );
 
     if (!existingRows.length) {
-      throw new Error("Production order not found");
+      throw Object.assign(
+        new Error("Production order not found"),
+        { status: 404 }
+      );
     }
 
     const existingOrder = existingRows[0];
 
-    if (existingOrder.status !== "PLANNED") {
-      throw new Error(
-        `Order cannot be edited because it is already ${existingOrder.status.toLowerCase()}`
+    if (Number(existingOrder.factory_id) !== factoryId) {
+      throw Object.assign(
+        new Error("You cannot edit an order outside your assigned factory"),
+        { status: 403 }
       );
     }
 
-    // ============================================================
-    // VALIDATE PRODUCT
-    // ============================================================
+    if (existingOrder.status !== "PLANNED") {
+      throw Object.assign(
+        new Error(
+          `Order cannot be edited because it is already ${String(existingOrder.status).toLowerCase()}`
+        ),
+        { status: 400 }
+      );
+    }
 
+    // Do not change product or line on an existing order.
+    if (
+      Number(existingOrder.product_id) !== selectedProductId ||
+      Number(existingOrder.line_id) !== selectedLineId
+    ) {
+      throw Object.assign(
+        new Error(
+          "Product and production line cannot be changed on an existing order. Create a new production order instead."
+        ),
+        { status: 400 }
+      );
+    }
+
+    const effectivePlannedDate =
+      plannedDate ||
+      (existingOrder.planned_date
+        ? String(existingOrder.planned_date).slice(0, 10)
+        : today);
+
+    if (!isValidDate(effectivePlannedDate)) {
+      throw Object.assign(
+        new Error("The existing planned date is invalid"),
+        { status: 400 }
+      );
+    }
+
+    // 4. Validate product
     const [productRows] = await connection.query(
       `
-      SELECT
-        id,
-        name,
-        part_code,
-        erp_no
+      SELECT id, name, part_code, erp_no
       FROM products
-      WHERE id = ?
-        AND is_active = 1
+      WHERE id = ? AND is_active = 1
       LIMIT 1
       `,
-      [productId]
+      [selectedProductId]
     );
 
     if (!productRows.length) {
-      throw new Error("Product not found");
+      throw Object.assign(
+        new Error("Product not found or inactive"),
+        { status: 400 }
+      );
     }
 
     const product = productRows[0];
 
-    // ============================================================
-    // VALIDATE PRODUCTION LINE
-    // ============================================================
-
+    // 5. Validate production line
     const [lineRows] = await connection.query(
       `
-      SELECT
-        id,
-        name,
-        factory_id
+      SELECT id, name, factory_id
       FROM production_lines
       WHERE id = ?
         AND factory_id = ?
         AND is_active = 1
       LIMIT 1
       `,
-      [lineId, factoryId]
+      [selectedLineId, factoryId]
     );
 
     if (!lineRows.length) {
-      throw new Error("Production line not found in user's factory");
-    }
-
-    // ============================================================
-    // GET PRODUCT STAGE FLOW
-    // ============================================================
-
-    const [stageFlowRows] = await connection.query(
-      `
-      SELECT
-        psf.stage_id,
-        psf.sequence_no
-      FROM product_stage_flow psf
-
-      INNER JOIN stages s
-        ON s.id = psf.stage_id
-
-      WHERE psf.product_id = ?
-        AND s.factory_id = ?
-        AND s.is_active = 1
-
-      ORDER BY psf.sequence_no ASC
-      `,
-      [productId, factoryId]
-    );
-
-    if (!stageFlowRows.length) {
-      throw new Error(
-        "No stage flow configured for this product in this factory"
+      throw Object.assign(
+        new Error("Production line not found in user's factory"),
+        { status: 400 }
       );
     }
 
-    // ============================================================
-    // GET PRODUCT SERIAL RULE
-    //
-    // Product-level rule only.
-    // Update does NOT modify the rule/counter.
-    // ============================================================
+    // 6. Validate the product's stage flow for this line.
+    const [stageFlowRows] = await connection.query(
+      `
+      SELECT psf.stage_id, psf.sequence_no
+      FROM product_stage_flow psf
+      INNER JOIN stages s
+        ON s.id = psf.stage_id
+       AND s.line_id = psf.line_id
+      WHERE psf.product_id = ?
+        AND psf.line_id = ?
+        AND s.factory_id = ?
+        AND s.is_active = 1
+      ORDER BY psf.sequence_no ASC
+      `,
+      [selectedProductId, selectedLineId, factoryId]
+    );
 
+    if (!stageFlowRows.length) {
+      throw Object.assign(
+        new Error("No stage flow configured for this product and line"),
+        { status: 400 }
+      );
+    }
+
+    // 7. Lock and read the active serial rule.
     const [serialRuleRows] = await connection.query(
       `
-      SELECT
-        id,
-        product_id,
-        rule,
-        current_year,
-        current_week,
-        next_serial,
-        is_active
+      SELECT id, product_id, rule, is_active
       FROM production_serial_rules
       WHERE product_id = ?
         AND is_active = 1
       LIMIT 1
+      FOR UPDATE
       `,
-      [productId]
+      [selectedProductId]
     );
 
     if (!serialRuleRows.length) {
-      throw new Error(
-        "No active production serial rule configured for this product"
+      throw Object.assign(
+        new Error("No active production serial rule configured for this product"),
+        { status: 400 }
       );
     }
 
     const serialRule = serialRuleRows[0];
-
-    // ============================================================
-    // PARSE SERIAL RULE
-    // ============================================================
 
     let rule;
 
@@ -942,10 +1253,6 @@ export const updateProductionOrder = async (req, res) => {
     if (!Array.isArray(rule) || !rule.length) {
       throw new Error("Production serial rule is invalid");
     }
-
-    // ============================================================
-    // GET SERIAL WIDTH
-    // ============================================================
 
     const serialSegments = rule.filter(
       (segment) => segment?.type === "SERIAL"
@@ -964,294 +1271,288 @@ export const updateProductionOrder = async (req, res) => {
       serialWidth < 1 ||
       serialWidth > 5
     ) {
-      throw new Error(
-        "Production serial rule has an invalid SERIAL width"
+      throw new Error("Production serial rule has an invalid SERIAL width");
+    }
+
+    const maxSerial = 10 ** serialWidth - 1;
+
+    if (quantity > maxSerial) {
+      throw Object.assign(
+        new Error(`Quantity exceeds serial capacity. Maximum: ${maxSerial}`),
+        { status: 400 }
       );
     }
 
-    // ============================================================
-    // GET AVAILABLE PRODUCT QR IDENTITIES
-    // ============================================================
-
-    const [qrRows] = await connection.query(
+    // 8. Load this order's existing serial assignments.
+    const [existingItemRows] = await connection.query(
       `
-      SELECT
-        id,
-        bucket_id,
-        product_id,
-        serial_no,
-        qr_data,
-        status
-      FROM production_qr_codes
-      WHERE product_id = ?
-        AND status IN ('GENERATED', 'PRINTED')
-      ORDER BY id ASC
-      `,
-      [productId]
-    );
-
-    if (qrRows.length < quantity) {
-      throw new Error(
-        `Insufficient generated Product QR codes. Required: ${quantity}, available: ${qrRows.length}`
-      );
-    }
-
-    // ============================================================
-    // SELECT QR IDENTITIES NOT ALREADY ASSIGNED TO THIS LINE
-    //
-    // IMPORTANT:
-    // Same QR on another line = ALLOWED.
-    // Same QR on this line = NOT ALLOWED.
-    //
-    // Exclude the CURRENT order because its items will be replaced.
-    // ============================================================
-
-    const candidateQrRows = [];
-
-    for (const qr of qrRows) {
-      const [existingItemRows] = await connection.query(
-        `
-        SELECT poi.id
-        FROM production_order_items poi
-
-        INNER JOIN production_orders po
-          ON po.id = poi.production_order_id
-
-        WHERE po.line_id = ?
-          AND po.product_id = ?
-          AND po.id <> ?
-          AND poi.serial_no = ?
-
-        LIMIT 1
-        `,
-        [lineId, productId, id, qr.qr_data]
-      );
-
-      if (!existingItemRows.length) {
-        candidateQrRows.push(qr);
-      }
-
-      if (candidateQrRows.length >= quantity) {
-        break;
-      }
-    }
-
-    if (candidateQrRows.length < quantity) {
-      throw new Error(
-        `Insufficient unassigned Product QR identities for this production line. Required: ${quantity}, available: ${candidateQrRows.length}`
-      );
-    }
-
-    // ============================================================
-    // LOCK SELECTED QR IDENTITIES
-    // ============================================================
-
-    const qrIds = candidateQrRows.map((row) => row.id);
-    const placeholders = qrIds.map(() => "?").join(",");
-
-    const [lockedQrRows] = await connection.query(
-      `
-      SELECT
-        id,
-        bucket_id,
-        product_id,
-        serial_no,
-        qr_data,
-        status
-      FROM production_qr_codes
-      WHERE id IN (${placeholders})
-        AND product_id = ?
-        AND status IN ('GENERATED', 'PRINTED')
-      ORDER BY id ASC
+      SELECT id, serial_no, sequence_no, status
+      FROM production_order_items
+      WHERE production_order_id = ?
+      ORDER BY sequence_no ASC, id ASC
       FOR UPDATE
       `,
-      [...qrIds, productId]
+      [orderId]
     );
 
-    if (lockedQrRows.length < quantity) {
-      throw new Error(
-        "Some selected Product QR codes are no longer available"
+    // Keep the existing serials first.
+    const retainedItems = existingItemRows.slice(0, quantity);
+    const excessItems = existingItemRows.slice(quantity);
+    const additionalQty = quantity - retainedItems.length;
+
+    const retainedSerials = new Set(
+      retainedItems.map((item) => item.serial_no)
+    );
+
+    const additionalSerials = [];
+
+    // 9. Allocate only the missing quantity.
+    // Search from 1 upward so released serials can be reused.
+    if (additionalQty > 0) {
+      await connection.query(
+        `
+        INSERT IGNORE INTO production_order_serial_counters
+          (product_id, line_id, next_serial)
+        VALUES (?, ?, 1)
+        `,
+        [selectedProductId, selectedLineId]
+      );
+
+      const [counterRows] = await connection.query(
+        `
+        SELECT next_serial
+        FROM production_order_serial_counters
+        WHERE product_id = ? AND line_id = ?
+        FOR UPDATE
+        `,
+        [selectedProductId, selectedLineId]
+      );
+
+      if (!counterRows.length) {
+        throw new Error("Unable to lock the production serial counter");
+      }
+
+      const dateParts = effectivePlannedDate.split("-").map(Number);
+      const [year, month, day] = dateParts;
+      const serialDate = new Date(year, month - 1, day);
+
+      const retainedSuffixes = retainedItems.map((item) =>
+        Number(item.serial_no.slice(-serialWidth))
+      );
+
+      let candidate = retainedSuffixes.length
+        ? Math.max(...retainedSuffixes) + 1
+        : 1;
+      let attempts = 0;
+
+      while (
+        additionalSerials.length < additionalQty &&
+        attempts < maxSerial
+      ) {
+        const serialNo = buildProductionSerial({
+          rule,
+          product,
+          serial: candidate,
+          date: serialDate,
+        });
+
+        if (!retainedSerials.has(serialNo)) {
+          const [assignedRows] = await connection.query(
+            `
+            SELECT 1
+            FROM production_order_items poi
+            INNER JOIN production_orders po
+              ON po.id = poi.production_order_id
+            WHERE po.product_id = ?
+              AND po.line_id = ?
+              AND po.id <> ?
+              AND poi.serial_no = ?
+            LIMIT 1
+            `,
+            [
+              selectedProductId,
+              selectedLineId,
+              orderId,
+              serialNo,
+            ]
+          );
+
+          const [usedRows] = await connection.query(
+            `
+            SELECT 1
+            FROM production
+            WHERE product_id = ?
+              AND line_id = ?
+              AND serial_no = ?
+            LIMIT 1
+            `,
+            [selectedProductId, selectedLineId, serialNo]
+          );
+
+          if (!assignedRows.length && !usedRows.length) {
+            additionalSerials.push({
+              serial_no: serialNo,
+              serial_value: candidate,
+            });
+          }
+        }
+
+        candidate = candidate >= maxSerial ? 1 : candidate + 1;
+        attempts += 1;
+      }
+
+      if (additionalSerials.length !== additionalQty) {
+        throw Object.assign(
+          new Error(
+            `Insufficient available serials. Required additional: ${additionalQty}, available: ${additionalSerials.length}`
+          ),
+          { status: 409 }
+        );
+      }
+
+      // Keep the counter as a hint for other code paths.
+      // Allocation itself searches for the lowest available serial.
+      await connection.query(
+        `
+        UPDATE production_order_serial_counters
+        SET next_serial = ?
+        WHERE product_id = ? AND line_id = ?
+        `,
+        [candidate, selectedProductId, selectedLineId]
       );
     }
 
-    // ============================================================
-    // LEGACY SERIAL SNAPSHOT
-    //
-    // These fields remain only because the existing
-    // production_orders table still contains them.
-    //
-    // They are NOT used for QR generation.
-    // ============================================================
+    const finalSerials = [
+      ...retainedItems.map((item) => ({
+        serial_no: item.serial_no,
+      })),
+      ...additionalSerials.map((item) => ({
+        serial_no: item.serial_no,
+      })),
+    ];
 
-    const firstQr = lockedQrRows[0];
-    const lastQr = lockedQrRows[quantity - 1];
+    const firstSerial = finalSerials[0];
+    const lastSerial = finalSerials[finalSerials.length - 1];
 
-    const serialStart = firstQr.serial_no;
-    const serialEnd = lastQr.serial_no;
+    const serialNumbers = finalSerials.map((item) =>
+      Number(item.serial_no.slice(-serialWidth))
+    );
 
-    const serialPrefix =
-      firstQr.qr_data?.slice(
-        0,
-        Math.max(0, firstQr.qr_data.length - serialWidth)
-      ) || "";
+    const serialStart = Math.min(...serialNumbers);
+    const serialEnd = Math.max(...serialNumbers);
 
-    // ============================================================
-    // UPDATE PRODUCTION ORDER
-    // ============================================================
+    const serialPrefix = firstSerial.serial_no.slice(
+      0,
+      Math.max(0, firstSerial.serial_no.length - serialWidth)
+    );
 
+    // 10. Update the order.
     await connection.query(
       `
       UPDATE production_orders
-      SET
-        product_id = ?,
-        line_id = ?,
-        target_qty = ?,
-        serial_prefix = ?,
-        serial_start = ?,
-        serial_end = ?,
-        serial_width = ?,
-        sequence_mode = ?,
-        planned_date = ?
+      SET target_qty = ?,
+          serial_prefix = ?,
+          serial_start = ?,
+          serial_end = ?,
+          serial_width = ?,
+          sequence_mode = ?,
+          planned_date = ?
       WHERE id = ?
       `,
       [
-        productId,
-        lineId,
         quantity,
         serialPrefix,
         serialStart,
         serialEnd,
         serialWidth,
         sequenceMode,
-        plannedDate || new Date(),
-        id,
+        effectivePlannedDate,
+        orderId,
       ]
     );
 
-    // ============================================================
-    // REMOVE OLD ITEMS + STAGES
-    // ============================================================
+    // 11. Delete only the excess items and release their serial numbers,
+    // so the next order can use them again (the order is still PLANNED,
+    // so there is no history to keep).
+    if (excessItems.length > 0) {
+      const excessIds = excessItems.map((item) => item.id);
+      const placeholders = excessIds.map(() => "?").join(",");
 
-    await connection.query(
-      `
-      DELETE FROM production_order_items
-      WHERE production_order_id = ?
-      `,
-      [id]
-    );
+      await connection.query(
+        `
+        DELETE FROM production_order_items
+        WHERE production_order_id = ?
+          AND id IN (${placeholders})
+        `,
+        [orderId, ...excessIds]
+      );
 
-    await connection.query(
-      `
-      DELETE FROM production_order_stages
-      WHERE production_order_id = ?
-      `,
-      [id]
-    );
+      await releaseSerialsToCounter(connection, {
+        productId: selectedProductId,
+        lineId: selectedLineId,
+        serialWidth,
+        releasedItems: excessItems,
+      });
+    }
 
-    // ============================================================
-    // CREATE NEW ORDER ITEMS
-    //
-    // sequence_no is LOCAL to this production order.
-    // ============================================================
-
-    const itemValues = lockedQrRows
-      .slice(0, quantity)
-      .map((qr, index) => [
-        id,
-        qr.qr_data,
-        index + 1,
+    // Insert only newly allocated serials.
+    if (additionalSerials.length > 0) {
+      const itemValues = additionalSerials.map((serial, index) => [
+        orderId,
+        serial.serial_no,
+        retainedItems.length + index + 1,
         "ACTIVE",
       ]);
 
-    if (itemValues.length) {
       await connection.query(
         `
-        INSERT INTO production_order_items (
-          production_order_id,
-          serial_no,
-          sequence_no,
-          status
-        )
+        INSERT INTO production_order_items
+          (production_order_id, serial_no, sequence_no, status)
         VALUES ?
         `,
         [itemValues]
       );
     }
 
-    // ============================================================
-    // CREATE NEW ORDER STAGES
-    //
-    // Always start from sequence 1 for a new PLANNED order.
-    // ============================================================
+    // Do not delete or recreate production_order_stages.
+    // The existing stage snapshots are preserved.
 
-    const stageValues = stageFlowRows.map((stage) => [
-      id,
-      stage.stage_id,
-      stage.sequence_no,
-      1,
-      "PENDING",
-    ]);
-
-    await connection.query(
-      `
-      INSERT INTO production_order_stages (
-        production_order_id,
-        stage_id,
-        sequence_order,
-        next_expected_sequence,
-        status
-      )
-      VALUES ?
-      `,
-      [stageValues]
-    );
-
-    // ============================================================
-    // COMMIT
-    // ============================================================
-
+    // 12. Commit.
     await connection.commit();
-
-    // ============================================================
-    // RESPONSE
-    // ============================================================
+    transactionStarted = false;
 
     return res.status(200).json({
       message: "Production order updated successfully",
-
       data: {
-        id: Number(id),
-
-        productId,
+        id: orderId,
+        productId: selectedProductId,
         productName: product.name,
-
-        lineId,
+        lineId: selectedLineId,
         lineName: lineRows[0].name,
-
         targetQty: quantity,
-
-        // Legacy snapshot fields
         serialPrefix,
         serialStart,
         serialEnd,
         serialWidth,
-
         serialRuleId: serialRule.id,
-
         qrRange: {
-          from: firstQr.serial_no,
-          to: lastQr.serial_no,
+          from: firstSerial.serial_no,
+          to: lastSerial.serial_no,
         },
-
         sequenceMode,
-
+        plannedDate: effectivePlannedDate,
         status: "PLANNED",
-
         stageCount: stageFlowRows.length,
       },
     });
   } catch (error) {
-    await connection.rollback();
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("ROLLBACK ERROR:", rollbackError);
+      }
+    }
 
     console.error("ERR IN UPDATE PRODUCTION ORDER:", error);
 
@@ -1261,11 +1562,13 @@ export const updateProductionOrder = async (req, res) => {
       });
     }
 
-    return res.status(500).json({
-      message: error.message,
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to update production order",
     });
   } finally {
-    connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 };
 
@@ -1629,7 +1932,6 @@ export const startProductionOrder = async (req, res) => {
     connection.release();
   }
 };
-
 // ============================================================
 // Get all Production Orders (list, with filters)
 // ============================================================
@@ -1994,6 +2296,120 @@ export const getProductionOrderItems = async (req, res) => {
     return res.status(500).json({ message: error.message });
   }
 };
+
+
+export const getMyLineProductionOrders = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Authenticated user not found",
+      });
+    }
+
+    // Always derive the user's production context from the database.
+    const [userRows] = await pool.query(
+      `
+      SELECT factory_id, line_id, stage_id
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (!userRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    const { factory_id, line_id, stage_id } = userRows[0];
+
+    if (!factory_id || !line_id || !stage_id) {
+      return res.status(403).json({
+        success: false,
+        message:
+          "Your factory, production line, or stage assignment is missing.",
+      });
+    }
+
+    const [orders] = await pool.query(
+      `
+      SELECT
+        po.id AS production_order_id,
+        po.order_no AS production_order_no,
+        po.product_id,
+        p.name AS product_name,
+        p.erp_no,
+        p.part_code,
+        po.factory_id,
+        po.line_id,
+        pl.name AS line_name,
+        po.target_qty,
+        COALESCE(sh.achieved_qty, 0) AS achieved_qty,
+        GREATEST(
+          po.target_qty - COALESCE(sh.achieved_qty, 0),
+          0
+        ) AS remaining_qty,
+        po.status AS production_order_status,
+        po.planned_date
+      FROM production_orders po
+      INNER JOIN products p
+        ON p.id = po.product_id
+      LEFT JOIN production_lines pl
+        ON pl.id = po.line_id
+      LEFT JOIN (
+        SELECT
+          production_order_id,
+          COUNT(DISTINCT scanned_value) AS achieved_qty
+        FROM scan_history
+        WHERE stage_id = ?
+          AND status = 'SUCCESS'
+          AND production_order_id IS NOT NULL
+        GROUP BY production_order_id
+      ) sh
+        ON sh.production_order_id = po.id
+      WHERE po.factory_id = ?
+        AND po.line_id = ?
+        AND po.status = 'RUNNING'
+        AND p.is_active = 1
+        AND EXISTS (
+          SELECT 1
+          FROM production_order_stages pos
+          WHERE pos.production_order_id = po.id
+            AND pos.stage_id = ?
+        )
+      ORDER BY po.id DESC
+      `,
+      [stage_id, factory_id, line_id, stage_id]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Production orders for your line fetched successfully",
+      context: {
+        factoryId: factory_id,
+        lineId: line_id,
+        stageId: stage_id,
+      },
+      count: orders.length,
+      data: orders,
+    });
+  } catch (error) {
+    console.error("ERR IN GET MY LINE PRODUCTION ORDERS:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch production orders for your line",
+      error: error.message,
+    });
+  }
+};
+
 
 // ============================================================
 // Cancel a Production Order

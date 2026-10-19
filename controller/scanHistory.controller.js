@@ -409,6 +409,7 @@ const handleSingleScan = async (conn, res, ctx) => {
     printer_name
   } = ctx;
 
+
   const isPackagingStage = !!packaging_config_id;
 
   await conn.beginTransaction();
@@ -2363,6 +2364,11 @@ export const submitScan = async (req, res) => {
       [userId]
     );
 
+    console.log("[MES USER CONTEXT]", {
+      authenticatedUserId: userId,
+      databaseUser: userRows[0],
+    });
+
     if (!userRows.length) {
       return res.status(401).json({
         success: false,
@@ -2714,6 +2720,8 @@ export const createGroup = async (req, res) => {
       `SELECT id, factory_id, line_id, stage_id FROM users WHERE id = ?`,
       [userId]
     );
+
+  
 
     if (!userRows.length)
       return res.status(401).json({ success: false, message: "User not found" });
