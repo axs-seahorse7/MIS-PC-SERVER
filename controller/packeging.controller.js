@@ -124,6 +124,7 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
     barcode_rule,
     label_template_id,
     is_active,
+    allow_partial_close,
   } = req.body;
 
   if (
@@ -220,7 +221,7 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
   const [result] = await pool.query(
     `
     INSERT INTO packaging_config
-      (
+    (
         product_id,
         stage_id,
         box_size,
@@ -230,10 +231,11 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
         label_template_id,
         current_serial,
         is_active,
+        allow_partial_close,
         created_at,
         updated_at
-      )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
     `,
     [
       product_id,
@@ -245,6 +247,8 @@ export const createPackagingConfig = asyncHandler(async (req, res) => {
       label_template_id,
       initialSerial,
       is_active ?? true,
+      allow_partial_close ?? false,
+
     ]
   );
 
@@ -267,6 +271,7 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
     barcode_format,
     barcode_rule,
     label_template_id,
+    allow_partial_close,
     is_active,
   } = req.body;
 
@@ -340,6 +345,7 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
     "barcode_format = ?",
     "barcode_rule = ?",
     "label_template_id = ?",
+    "allow_partial_close = ?",
     "is_active = ?",
   ];
   const values = [
@@ -350,6 +356,7 @@ export const updatePackagingConfig = asyncHandler(async (req, res) => {
     barcode_format,
     JSON.stringify(barcode_rule),
     label_template_id,
+    allow_partial_close ?? false,
     is_active ?? true,
   ];
 
@@ -381,6 +388,7 @@ export const patchPackagingConfig = asyncHandler(async (req, res) => {
     "barcode_format",
     "barcode_rule",
     "label_template_id",
+    "allow_partial_close",
     "is_active",
   ];
 

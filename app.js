@@ -32,6 +32,7 @@ import factoryRoutes from "./routes/factory.routes.js";
 import ictRoutes from "./routes/ict.routes.js";
 import productionTargetRoutes from "./routes/productionTarget.routes.js";
 import packegingConfigRoutes from "./routes/packegingConfig.routes.js";
+import partialBoxWorkerRoutes from "./routes/partialBoxWorker.routes.js";
 import printerRoutes from "./routes/printers.route.js";
 import printRoutes from "./routes/print.routes.js"
 import productionOrderRoutes from "./routes/productionOrder.routes.js";
@@ -95,45 +96,46 @@ app.use("/api/users", userRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/ict", ictRoutes);
 
-app.use("/api/external-sources", externalSourceRoutes);
-app.use("/api/print", printRoutes);
+app.use("/api/external-sources",      externalSourceRoutes);
+app.use("/api/print",                 printRoutes);
 
 
 app.use(verifyToken); // Apply JWT verification middleware to all routes below
 
 // ---------- Routes ----------
-app.use("/api/categories", categoryRoutes);
+app.use("/api/categories",              categoryRoutes);
 
-app.use("/api/stages", stageRoutes);
-app.use("/api/stage-scan-fields", stageScanFieldRoutes);
+app.use("/api/stages",                  stageRoutes);
+app.use("/api/stage-scan-fields",       stageScanFieldRoutes);
 
-app.use("/api/products", productRoutes);
-app.use("/api/product-stage-flow", productStagesFlowRoutes);
-app.use("/api/product-fields", productionFieldRoutes);
-app.use("/api/production-orders",productionOrderRoutes);
+app.use("/api/products",                productRoutes);
+app.use("/api/product-stage-flow",      productStagesFlowRoutes);
+app.use("/api/product-fields",          productionFieldRoutes);
+app.use("/api/production-orders",       productionOrderRoutes);
 
-app.use("/api/items", itemsRoutes);
-app.use("/api/item-field-values", itemFieldValuesRoutes);
+app.use("/api/items",                   itemsRoutes);
+app.use("/api/item-field-values",       itemFieldValuesRoutes);
 
-app.use("/api/scan-history", scanHistoryRoutes);
+app.use("/api/scan-history",            scanHistoryRoutes);
 
 app.use("/api/fct", fctRoutes);
-app.use("/api/external-results", externalResultRoutes);
+app.use("/api/external-results",         externalResultRoutes);
 app.use("/api/external-source-mappings", externalSourceMappingRoutes);
 
-app.use("/api/production-lines", productionLineRoutes);
-app.use("/api/factories", factoryRoutes);
+app.use("/api/production-lines",        productionLineRoutes);
+app.use("/api/factories",               factoryRoutes);
 
-app.use("/api/production-targets", productionTargetRoutes);
-app.use("/api/packaging-config", packegingConfigRoutes);
-app.use("/api/printers", printerRoutes);
+app.use("/api/production-targets",      productionTargetRoutes);
+app.use("/api/packaging-config",        packegingConfigRoutes);
+app.use("/api/packaging-config",        partialBoxWorkerRoutes);
+app.use("/api/printers",                printerRoutes);
 
 
-app.use("/api/customer-serial-rules", customerSerialRuleRoutes);
-app.use("/api/label-templates", labelTemplateRoutes);
-app.use("/api/product-print-jobs",productPrintJobRoutes);
+app.use("/api/customer-serial-rules",   customerSerialRuleRoutes);
+app.use("/api/label-templates",         labelTemplateRoutes);
+app.use("/api/product-print-jobs",      productPrintJobRoutes);
 app.use("/api/production-serial-rules", productionSerialRuleRoutes);
-app.use("/api/production-qr", productionQrRoutes);
+app.use("/api/production-qr",           productionQrRoutes);
 
 
 // ---------- 404 ----------
