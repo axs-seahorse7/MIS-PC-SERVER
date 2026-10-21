@@ -44,6 +44,10 @@ import productionSerialRuleRoutes from "./routes/productionSerialRule.routes.js"
 import productionQrRoutes from "./routes/productionQr.routes.js";
 
 
+import reportsRoutes from "./routes/reports.routes.js";
+import serialHistoryRoutes from "./routes/serialHistory.routes.js";
+
+
 
 
 const app = express();
@@ -136,6 +140,10 @@ app.use("/api/label-templates",         labelTemplateRoutes);
 app.use("/api/product-print-jobs",      productPrintJobRoutes);
 app.use("/api/production-serial-rules", productionSerialRuleRoutes);
 app.use("/api/production-qr",           productionQrRoutes);
+
+
+app.use("/api/reports", reportsRoutes);
+app.use("/api/serial-history", serialHistoryRoutes);
 
 
 // ---------- 404 ----------
