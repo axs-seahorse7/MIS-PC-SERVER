@@ -171,6 +171,8 @@ async function getSerialHistory(serialInput) {
          st.name AS stage_name,
          st.machine_code,
          u.username AS scanned_by,
+        u.name AS scanned_by_name,
+        u.line_name AS line_name,
          po.order_no AS production_order_no
        FROM scan_history sh
        LEFT JOIN factories fa ON fa.id = sh.factory_id

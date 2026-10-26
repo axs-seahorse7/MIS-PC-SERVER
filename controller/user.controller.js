@@ -3,31 +3,62 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
 // createUser
+
 export const createUser = async (req, res) => {
   try {
-    const { username, password, name, email, role, factory_id, line_id, stage_id } = req.body;
+    const {
+      username,
+      password,
+      name,
+      email,
+      role,
+      factory_id,
+      line_id,
+      line_name,
+      stage_id,
+    } = req.body;
+
+    if (!username || !password || !name || !role) {
+      return res.status(400).json({
+        success: false,
+        message: "Username, password, name and role are required",
+      });
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const [result] = await pool.query(
-      `INSERT INTO users (username, password, name, email, role, factory_id, line_id, stage_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [username, hashedPassword, name, email, role, factory_id || null, line_id || null, stage_id || null]
+      `INSERT INTO users
+        (username, password, name, email, role, factory_id, line_id, line_name, stage_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        username,
+        hashedPassword,
+        name,
+        email || null,
+        role,
+        factory_id || null,
+        line_id || null,
+        line_name?.trim() || null,
+        stage_id || null,
+      ]
     );
 
     return res.status(201).json({
       success: true,
       userId: result.insertId,
+      message: "User created successfully",
     });
   } catch (err) {
-    console.log(err);
+    console.error("CREATE USER ERROR:", err);
+
     return res.status(500).json({
       success: false,
       message: err.message,
     });
   }
 };
+
 
 export const loginUser = async (req, res) => {
   try {
@@ -246,31 +277,33 @@ export const logout = (req, res) => {
   return res.status(200).json({ success: true, message: "Logged out successfully" });
 };
 
-
 // getUsers
 export const getUsers = async (req, res) => {
   try {
-    const [users] = await pool.query(`
-      SELECT
-        u.id,
-        u.username,
-        u.name,
-        u.email,
-        u.role,
-        u.factory_id,
-        f.name AS factory_name,
-        u.line_id,
-        pl.name AS line_name,
-        u.stage_id,
-        s.name AS stage_name,
-        u.is_active,
-        u.created_at
-      FROM users u
-      LEFT JOIN factories f ON f.id = u.factory_id
-      LEFT JOIN production_lines pl ON pl.id = u.line_id
-      LEFT JOIN stages s ON s.id = u.stage_id
-      ORDER BY u.id DESC
-    `);
+    
+      const [users] = await pool.query(`
+        SELECT
+          u.id,
+          u.username,
+          u.name,
+          u.email,
+          u.role,
+          u.factory_id,
+          f.name AS factory_name,
+          u.line_id,
+          u.line_name AS assigned_line_name,
+          pl.name AS production_line_name,
+          u.stage_id,
+          s.name AS stage_name,
+          u.is_active,
+          u.created_at
+        FROM users u
+        LEFT JOIN factories f ON f.id = u.factory_id
+        LEFT JOIN production_lines pl ON pl.id = u.line_id
+        LEFT JOIN stages s ON s.id = u.stage_id
+        ORDER BY u.id DESC
+      `);
+
 
     return res.status(200).json(users);
   } catch (error) {
@@ -294,6 +327,7 @@ export const updateUser = async (req, res) => {
       "role",
       "factory_id",
       "line_id",
+      "line_name",
       "stage_id",
       "is_active",
     ];
@@ -380,35 +414,42 @@ export const changePassword = async (
   }
 };
 
-export const deleteUser = async (
-  req,
-  res
-) => {
+
+export const deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
 
     const [result] = await pool.query(
-      `
-      UPDATE users
-      SET is_active = 0
-      WHERE id = ?
-      `,
+      `DELETE FROM users WHERE id = ?`,
       [id]
     );
 
-    if (!result.affectedRows) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({
+        success: false,
         message: "User not found",
       });
     }
 
     return res.status(200).json({
-      message: "User deactivated successfully",
+      success: true,
+      message: "User permanently deleted successfully",
     });
   } catch (error) {
-    console.log("ERR IN DELETE USER:", error);
+    console.error("ERR IN DELETE USER:", error);
+
+    // Foreign-key constraint errors may mean this user is referenced
+    // by scan history or other records. Do not delete those records.
+    if (error.code === "ER_ROW_IS_REFERENCED_2") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Cannot permanently delete this user because other records reference them. Preserve the related history.",
+      });
+    }
 
     return res.status(500).json({
+      success: false,
       message: error.message,
     });
   }

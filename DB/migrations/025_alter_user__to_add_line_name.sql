@@ -1,0 +1,2 @@
+ALTER TABLE users
+ADD COLUMN line_name VARCHAR(100) NULL AFTER line_id;
