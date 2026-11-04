@@ -50,11 +50,12 @@ async function syncProduction(conn, {
 
         await conn.query(
             `UPDATE production
-             SET
-                current_stage_id = ?,
-                current_sequence_no = ?,
-                updated_at = NOW()
-             WHERE serial_no = ?`,
+              SET
+                  current_stage_id = ?,
+                  current_sequence_no = ?,
+                  updated_at = NOW()
+              WHERE serial_no = ?
+                AND status NOT IN ('REWORK', 'REJECTED')`,
             [
                 stage_id,
                 currentSeq,
@@ -73,7 +74,8 @@ async function syncProduction(conn, {
                 status='COMPLETED',
                 completed_at = NOW(),
                 updated_at = NOW()
-             WHERE serial_no = ?`,
+             WHERE serial_no = ?
+             AND status NOT IN ('REWORK', 'REJECTED')`,
             [scanned_value]
         );
 
@@ -2497,8 +2499,7 @@ export const submitScan = async (req, res) => {
     //                          to the Product QR
     // ============================================================
 
-    const isAfterCustomerBinding =
-      bindingSequence !== null && Number(currentSeq) > bindingSequence;
+    const isAfterCustomerBinding = bindingSequence !== null && Number(currentSeq) > bindingSequence;
 
     if (isAfterCustomerBinding) {
       // ----------------------------------------------------------

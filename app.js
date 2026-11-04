@@ -47,6 +47,7 @@ import productionQrRoutes from "./routes/productionQr.routes.js";
 import reportsRoutes from "./routes/reports.routes.js";
 import serialHistoryRoutes from "./routes/serialHistory.routes.js";
 
+import qualityRoutes from "./routes/quality.routes.js";
 
 
 
@@ -144,6 +145,9 @@ app.use("/api/production-qr",           productionQrRoutes);
 
 app.use("/api/reports", reportsRoutes);
 app.use("/api/serial-history", serialHistoryRoutes);
+
+app.use("/api/quality", qualityRoutes);
+
 
 
 // ---------- 404 ----------

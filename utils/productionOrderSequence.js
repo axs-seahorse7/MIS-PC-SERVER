@@ -325,15 +325,24 @@ export const validateProductionOrderSequence = async (
     }
 
   // ============================================================
-  // 6. Rejected item
+  // 6. Rejected item && Rework item
   // ============================================================
 
   if (item.item_status === "REJECTED") {
     return {
       ok: false,
       errorType: "SERIAL_REJECTED",
-      message:
-        "This product has been rejected and cannot continue production.",
+      message: "This product has been rejected and cannot continue production.",
+      productionOrderId: item.production_order_id,
+      serialNo: item.serial_no,
+    };
+  }
+
+  if (item.item_status === "REWORK") {
+    return {
+      ok: false,
+      errorType: "SERIAL_IN_REWORK",
+      message: "This product is currently under rework and cannot continue normal production.",
       productionOrderId: item.production_order_id,
       serialNo: item.serial_no,
     };
