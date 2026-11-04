@@ -105,30 +105,31 @@ async function getSerialHistory(serialInput) {
   // Include PO details and the product/line context of each order.
   const [orderItems] = await pool.query(
     `SELECT
-       poi.serial_no,
-       poi.sequence_no AS production_sequence,
-       poi.status AS item_status,
-       poi.rejected_at,
-       po.id AS production_order_id,
-       po.order_no AS production_order_no,
-       po.status AS production_order_status,
-       po.product_id,
-       pr.name AS product_name,
-       pr.part_code AS product_code,
-       po.factory_id,
-       fa.name AS factory_name,
-       fa.code AS factory_code,
-       po.line_id,
-       pl.name AS line_name,
-       pl.code AS line_code
-     FROM production_order_items poi
-     JOIN production_orders po
-       ON po.id = poi.production_order_id
-     LEFT JOIN products pr ON pr.id = po.product_id
-     LEFT JOIN factories fa ON fa.id = po.factory_id
-     LEFT JOIN production_lines pl ON pl.id = po.line_id
-     WHERE poi.serial_no = ?
-     ORDER BY po.id ASC`,
+      poi.id AS production_order_item_id,
+      poi.serial_no,
+      poi.sequence_no AS production_sequence,
+      poi.status AS item_status,
+      poi.rejected_at,
+      po.id AS production_order_id,
+      po.order_no AS production_order_no,
+      po.status AS production_order_status,
+      po.product_id,
+      pr.name AS product_name,
+      pr.part_code AS product_code,
+      po.factory_id,
+      fa.name AS factory_name,
+      fa.code AS factory_code,
+      po.line_id,
+      pl.name AS line_name,
+      pl.code AS line_code
+    FROM production_order_items poi
+    JOIN production_orders po
+      ON po.id = poi.production_order_id
+    LEFT JOIN products pr ON pr.id = po.product_id
+    LEFT JOIN factories fa ON fa.id = po.factory_id
+    LEFT JOIN production_lines pl ON pl.id = po.line_id
+    WHERE poi.serial_no = ?
+    ORDER BY po.id ASC`,
     [serial]
   );
 
@@ -188,6 +189,93 @@ async function getSerialHistory(serialInput) {
 
     scans = rows;
   }
+
+    // ------------------------------------------------------------
+    // Production route configured for this product
+    // ------------------------------------------------------------
+
+    const productIds = [
+      ...new Set(
+        orderItems
+          .map((row) => Number(row.product_id))
+          .filter(Boolean)
+      ),
+    ];
+
+    let configuredStageFlow = [];
+
+    if (productIds.length) {
+      const placeholders = productIds.map(() => "?").join(",");
+
+      const [flowRows] = await pool.query(
+        `SELECT
+          psf.product_id,
+          psf.sequence_no,
+          psf.stage_id,
+          psf.is_external_dependency,
+          psf.external_machine_type,
+          st.machine_code AS machine_code,
+          st.name AS stage_name,
+          st.description AS stage_description
+        FROM product_stage_flow psf
+        INNER JOIN stages st ON st.id = psf.stage_id
+        WHERE psf.product_id IN (${placeholders})
+        ORDER BY psf.product_id, psf.sequence_no ASC`,
+        productIds
+      );
+
+      configuredStageFlow = flowRows;
+    }
+
+    // ------------------------------------------------------------
+    // Complete quality / rework / rejection event history
+    // ------------------------------------------------------------
+
+    const itemIds = [
+      ...new Set(
+        orderItems
+          .map((row) =>
+            Number(
+              row.production_order_item_id ?? row.id
+            )
+          )
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
+
+    let qualityHistory = [];
+
+    if (itemIds.length) {
+      const placeholders = itemIds.map(() => "?").join(",");
+
+      const [historyRows] = await pool.query(
+        `SELECT
+          qh.id,
+          qh.production_order_item_id,
+          qh.action_type,
+          qh.rework_station_id,
+          rs.name AS rework_station_name,
+          qh.stage_id,
+          st.name AS stage_name,
+          qh.reason,
+          qh.performed_by,
+          u.username AS performed_by_username,
+          u.name AS performed_by_name,
+          qh.created_at
+        FROM production_item_quality_history qh
+        LEFT JOIN rework_stations rs
+          ON rs.id = qh.rework_station_id
+        LEFT JOIN stages st
+          ON st.id = qh.stage_id
+        LEFT JOIN users u
+          ON u.id = qh.performed_by
+        WHERE qh.production_order_item_id IN (${placeholders})
+        ORDER BY qh.created_at ASC, qh.id ASC`,
+        itemIds
+      );
+
+      qualityHistory = historyRows;
+    }
 
   // The current configuration stores external machine results in ict_results.
   // Preserve every row: repeated attempts are important for failure analysis.
@@ -338,16 +426,40 @@ async function getSerialHistory(serialInput) {
     failure_summary: {
       ict_failures: countFailures(ictAttempts),
       fct_failures: countFailures(fctAttempts),
-      other_machine_failures: allAttempts.filter(
-        (row) =>
+      other_machine_failures: allAttempts.filter((row) =>
           row.machine_type === "OTHER" &&
           String(row.result || "").toUpperCase() === "FAIL"
       ).length,
+
+      configured_stage_flow: configuredStageFlow,
+      quality_history: qualityHistory,
+
+      quality_summary: {
+        total_rework_cycles: qualityHistory.filter(
+          (event) => event.action_type === "REWORK_STARTED"
+        ).length,
+
+        total_rework_submissions: qualityHistory.filter(
+          (event) => event.action_type === "REWORK_SUBMITTED"
+        ).length,
+
+        total_qa_approvals: qualityHistory.filter(
+          (event) => event.action_type === "QA_APPROVED"
+        ).length,
+
+        total_qa_send_backs: qualityHistory.filter(
+          (event) => event.action_type === "QA_SENT_BACK"
+        ).length,
+
+        total_rejections: qualityHistory.filter(
+          (event) => event.action_type === "REJECTED"
+        ).length,
+      },
+      
       total_recorded_machine_failures: totalFailures,
       total_attempts: allAttempts.length,
       total_passes: countPasses(allAttempts),
-      note:
-        "Every recorded machine-result row is preserved. Deleted scan-history records cannot be reconstructed from this table.",
+      note: "Every recorded machine-result row is preserved. Deleted scan-history records cannot be reconstructed from this table.",
     },
 
     boxes: boxRows,

@@ -13,6 +13,10 @@ import {
   getQualityHistory,
 } from "../controller/quality.controller.js";
 
+import {
+  getQualityItems,
+} from "../controller/adminQuality.controller.js";
+
 const router = express.Router();
 
 router.get("/stations", getReworkStations);
@@ -29,5 +33,8 @@ router.post("/qa/send-back", sendBackRework);
 router.post("/reject", rejectProduct);
 
 router.get("/history/:serialNo", getQualityHistory);
+
+
+router.get("/items", getQualityItems);
 
 export default router;
