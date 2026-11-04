@@ -348,6 +348,17 @@ export const validateProductionOrderSequence = async (
     };
   }
 
+  if (item.item_status === "PENDING_QA") {
+    return {
+      ok: false,
+      errorType: "SERIAL_PENDING_QA",
+      message:
+        "This product is awaiting QA approval and cannot continue production.",
+      productionOrderId: item.production_order_id,
+      serialNo: item.serial_no,
+    };
+  }
+
   // ============================================================
   // 7. Current Product Stage
   // ============================================================

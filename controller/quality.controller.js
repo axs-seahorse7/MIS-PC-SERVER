@@ -1,7 +1,29 @@
 
 import { pool } from "../DB/config/mysql.config.js";
 
-const isAdmin = (user) => ["SYSTEM_ADMIN", "ADMIN"].includes(user?.role);
+const isAdmin = (user) =>
+  ["SYSTEM_ADMIN", "ADMIN"].includes(user?.role);
+
+const isOperator = (user) =>
+  user?.role === "OPERATOR";
+
+const requireOperator = (user) => {
+  if (!isOperator(user)) {
+    throw Object.assign(
+      new Error("Only operators can perform rework operations."),
+      { status: 403 }
+    );
+  }
+};
+
+const requireAdmin = (user) => {
+  if (!isAdmin(user)) {
+    throw Object.assign(
+      new Error("Only Admin can perform QA approval actions."),
+      { status: 403 }
+    );
+  }
+};
 
 const getUserContext = async (conn, userId) => {
   const [rows] = await conn.query(
@@ -313,8 +335,11 @@ export const updateReworkStationStatus = async (req, res) => {
 // ----------------------------------------------------
 export const startRework = async (req, res) => {
   const conn = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
+    requireOperator(req.user);
+
     const { serial_no, station_id, reason } = req.body;
 
     if (!serial_no?.trim() || !station_id) {
@@ -325,6 +350,7 @@ export const startRework = async (req, res) => {
     }
 
     await conn.beginTransaction();
+    transactionStarted = true;
 
     const user = await getUserContext(conn, req.user.id);
 
@@ -349,27 +375,42 @@ export const startRework = async (req, res) => {
       user.line_id
     );
 
-    if (item.item_status === "REJECTED") {
-      throw Object.assign(new Error("Rejected products cannot enter rework."), { status: 409 });
+    // Only ACTIVE products can enter rework.
+    if (item.item_status !== "ACTIVE") {
+      throw Object.assign(
+        new Error(
+          `Product cannot enter rework from its current status: ${item.item_status}.`
+        ),
+        { status: 409 }
+      );
     }
 
-    if (item.item_status === "REWORK") {
-      throw Object.assign(new Error("This product is already under rework."), { status: 409 });
-    }
-
-    await conn.query(
+    const [updateResult] = await conn.query(
       `UPDATE production_order_items
        SET status = 'REWORK',
            rework_station_id = ?,
            rework_started_at = NOW(),
-           rework_started_by = ?
+           rework_started_by = ?,
+           rework_submitted_at = NULL,
+           rework_completed_by = NULL,
+           qa_reviewed_by = NULL,
+           qa_reviewed_at = NULL,
+           qa_remarks = NULL
        WHERE id = ? AND status = 'ACTIVE'`,
       [station.id, user.id, item.item_id]
     );
 
+    if (updateResult.affectedRows !== 1) {
+      throw Object.assign(
+        new Error("Product status changed. Please scan again."),
+        { status: 409 }
+      );
+    }
+
     await conn.query(
       `UPDATE production
-       SET status = 'REWORK', updated_at = NOW()
+       SET status = 'REWORK',
+           updated_at = NOW()
        WHERE serial_no = ?
          AND factory_id = ?
          AND line_id = ?
@@ -379,8 +420,14 @@ export const startRework = async (req, res) => {
 
     await conn.query(
       `INSERT INTO production_item_quality_history
-       (production_order_item_id, action_type, rework_station_id,
-        stage_id, reason, performed_by)
+       (
+         production_order_item_id,
+         action_type,
+         rework_station_id,
+         stage_id,
+         reason,
+         performed_by
+       )
        VALUES (?, 'REWORK_STARTED', ?, ?, ?, ?)`,
       [
         item.item_id,
@@ -392,6 +439,7 @@ export const startRework = async (req, res) => {
     );
 
     await conn.commit();
+    transactionStarted = false;
 
     return res.json({
       success: true,
@@ -405,7 +453,9 @@ export const startRework = async (req, res) => {
       },
     });
   } catch (error) {
-    await conn.rollback();
+    if (transactionStarted) {
+      await conn.rollback();
+    }
 
     return res.status(error.status || 500).json({
       success: false,
@@ -421,8 +471,11 @@ export const startRework = async (req, res) => {
 // ----------------------------------------------------
 export const completeRework = async (req, res) => {
   const conn = await pool.getConnection();
+  let transactionStarted = false;
 
   try {
+    requireOperator(req.user);
+
     const { serial_no, station_id, reason } = req.body;
 
     if (!serial_no?.trim() || !station_id) {
@@ -433,6 +486,7 @@ export const completeRework = async (req, res) => {
     }
 
     await conn.beginTransaction();
+    transactionStarted = true;
 
     const user = await getUserContext(conn, req.user.id);
 
@@ -471,19 +525,28 @@ export const completeRework = async (req, res) => {
       );
     }
 
-    await conn.query(
+    const [updateResult] = await conn.query(
       `UPDATE production_order_items
-       SET status = 'ACTIVE',
-           rework_station_id = NULL,
-           rework_started_at = NULL,
-           rework_started_by = NULL
-       WHERE id = ? AND status = 'REWORK'`,
-      [item.item_id]
+       SET status = 'PENDING_QA',
+           rework_submitted_at = NOW(),
+           rework_completed_by = ?
+       WHERE id = ?
+         AND status = 'REWORK'`,
+      [user.id, item.item_id]
     );
 
+    if (updateResult.affectedRows !== 1) {
+      throw Object.assign(
+        new Error("Unable to submit rework. Please try again."),
+        { status: 409 }
+      );
+    }
+
+    // Keep legacy production status as REWORK until Admin approval.
     await conn.query(
       `UPDATE production
-       SET status = 'IN_PROGRESS', updated_at = NOW()
+       SET status = 'REWORK',
+           updated_at = NOW()
        WHERE serial_no = ?
          AND factory_id = ?
          AND line_id = ?
@@ -493,9 +556,15 @@ export const completeRework = async (req, res) => {
 
     await conn.query(
       `INSERT INTO production_item_quality_history
-       (production_order_item_id, action_type, rework_station_id,
-        stage_id, reason, performed_by)
-       VALUES (?, 'REWORK_COMPLETED', ?, ?, ?, ?)`,
+       (
+         production_order_item_id,
+         action_type,
+         rework_station_id,
+         stage_id,
+         reason,
+         performed_by
+       )
+       VALUES (?, 'REWORK_SUBMITTED', ?, ?, ?, ?)`,
       [
         item.item_id,
         station.id,
@@ -506,19 +575,22 @@ export const completeRework = async (req, res) => {
     );
 
     await conn.commit();
+    transactionStarted = false;
 
     return res.json({
       success: true,
-      message: "Rework completed. Product released to normal production.",
+      message: "Rework submitted successfully. Waiting for Admin approval.",
       data: {
         serial_no: item.serial_no,
         production_order_id: item.production_order_id,
-        status: "ACTIVE",
+        status: "PENDING_QA",
         sequence_no: item.sequence_no,
       },
     });
   } catch (error) {
-    await conn.rollback();
+    if (transactionStarted) {
+      await conn.rollback();
+    }
 
     return res.status(error.status || 500).json({
       success: false,
@@ -527,6 +599,208 @@ export const completeRework = async (req, res) => {
   } finally {
     conn.release();
   }
+};
+
+// ----------------------------------------------------
+// Helper: Find and lock a product awaiting QA approval
+// ----------------------------------------------------
+const getPendingQaItem = async (conn, serialNo) => {
+  const [rows] = await conn.query(
+    `SELECT
+        poi.id AS item_id,
+        poi.production_order_id,
+        poi.serial_no,
+        poi.sequence_no,
+        poi.status AS item_status,
+        poi.rework_station_id,
+        poi.rework_completed_by,
+        po.order_no,
+        po.factory_id,
+        po.line_id
+     FROM production_order_items poi
+     INNER JOIN production_orders po
+       ON po.id = poi.production_order_id
+     WHERE poi.serial_no = ?
+       AND poi.status = 'PENDING_QA'
+       AND po.status = 'RUNNING'
+     ORDER BY poi.id DESC
+     LIMIT 2
+     FOR UPDATE`,
+    [serialNo]
+  );
+
+  if (!rows.length) {
+    throw Object.assign(
+      new Error("Product not found in pending QA status."),
+      { status: 404 }
+    );
+  }
+
+  if (rows.length > 1) {
+    throw Object.assign(
+      new Error("Multiple pending QA records found for this serial. Manual investigation is required."),
+      { status: 409 }
+    );
+  }
+
+  return rows[0];
+};
+
+// ----------------------------------------------------
+// Shared QA review handler
+// ----------------------------------------------------
+const reviewRework = async (req, res, decision) => {
+  const conn = await pool.getConnection();
+  let transactionStarted = false;
+
+  try {
+    requireAdmin(req.user);
+
+    const { serial_no, remarks } = req.body;
+
+    if (!serial_no?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "serial_no is required.",
+      });
+    }
+
+    if (decision === "SEND_BACK" && !remarks?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Remarks are required when sending a product back for rework.",
+      });
+    }
+
+    await conn.beginTransaction();
+    transactionStarted = true;
+
+    const item = await getPendingQaItem(conn, serial_no.trim());
+
+    // Prevent the operator from approving their own submission.
+    if (Number(item.rework_completed_by) === Number(req.user.id)) {
+      throw Object.assign(
+        new Error("You cannot review your own rework submission."),
+        { status: 403 }
+      );
+    }
+
+    let updateResult;
+
+    if (decision === "APPROVE") {
+      [updateResult] = await conn.query(
+        `UPDATE production_order_items
+         SET status = 'ACTIVE',
+             rework_station_id = NULL,
+             rework_started_at = NULL,
+             rework_started_by = NULL,
+             qa_reviewed_by = ?,
+             qa_reviewed_at = NOW(),
+             qa_remarks = ?
+         WHERE id = ?
+           AND status = 'PENDING_QA'`,
+        [req.user.id, remarks?.trim() || null, item.item_id]
+      );
+    } else {
+      [updateResult] = await conn.query(
+        `UPDATE production_order_items
+         SET status = 'REWORK',
+             rework_submitted_at = NULL,
+             rework_completed_by = NULL,
+             qa_reviewed_by = ?,
+             qa_reviewed_at = NOW(),
+             qa_remarks = ?
+         WHERE id = ?
+           AND status = 'PENDING_QA'`,
+        [req.user.id, remarks.trim(), item.item_id]
+      );
+    }
+
+    if (updateResult.affectedRows !== 1) {
+      throw Object.assign(
+        new Error("Product status changed. Please refresh and try again."),
+        { status: 409 }
+      );
+    }
+
+    // Update the legacy production record only when QA approves.
+    if (decision === "APPROVE") {
+      await conn.query(
+        `UPDATE production
+         SET status = 'IN_PROGRESS',
+             updated_at = NOW()
+         WHERE serial_no = ?
+           AND factory_id = ?
+           AND line_id = ?
+           AND status = 'REWORK'`,
+        [item.serial_no, item.factory_id, item.line_id]
+      );
+    }
+
+    // Record the QA decision in quality history.
+    await conn.query(
+      `INSERT INTO production_item_quality_history
+       (
+         production_order_item_id,
+         action_type,
+         rework_station_id,
+         stage_id,
+         reason,
+         performed_by
+       )
+       VALUES (?, ?, ?, NULL, ?, ?)`,
+      [
+        item.item_id,
+        decision === "APPROVE" ? "QA_APPROVED" : "QA_SENT_BACK",
+        item.rework_station_id,
+        remarks?.trim() || null,
+        req.user.id,
+      ]
+    );
+
+    await conn.commit();
+    transactionStarted = false;
+
+    return res.json({
+      success: true,
+      message:
+        decision === "APPROVE"
+          ? "Rework approved. Product released to normal production."
+          : "Product sent back for rework.",
+      data: {
+        serial_no: item.serial_no,
+        production_order_id: item.production_order_id,
+        status: decision === "APPROVE" ? "ACTIVE" : "REWORK",
+        sequence_no: item.sequence_no,
+        reviewed_by: req.user.id,
+      },
+    });
+  } catch (error) {
+    if (transactionStarted) {
+      await conn.rollback();
+    }
+
+    return res.status(error.status || 500).json({
+      success: false,
+      message: error.message,
+    });
+  } finally {
+    conn.release();
+  }
+};
+
+// ----------------------------------------------------
+// POST /api/quality/qa/approve
+// ----------------------------------------------------
+export const approveRework = async (req, res) => {
+  return reviewRework(req, res, "APPROVE");
+};
+
+// ----------------------------------------------------
+// POST /api/quality/qa/send-back
+// ----------------------------------------------------
+export const sendBackRework = async (req, res) => {
+  return reviewRework(req, res, "SEND_BACK");
 };
 
 // ----------------------------------------------------

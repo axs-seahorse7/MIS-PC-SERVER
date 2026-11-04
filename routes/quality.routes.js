@@ -7,6 +7,8 @@ import {
   updateReworkStationStatus,
   startRework,
   completeRework,
+  approveRework,
+  sendBackRework,
   rejectProduct,
   getQualityHistory,
 } from "../controller/quality.controller.js";
@@ -20,6 +22,10 @@ router.patch("/stations/:id/status", updateReworkStationStatus);
 
 router.post("/rework/start", startRework);
 router.post("/rework/complete", completeRework);
+
+router.post("/qa/approve", approveRework);
+router.post("/qa/send-back", sendBackRework);
+
 router.post("/reject", rejectProduct);
 
 router.get("/history/:serialNo", getQualityHistory);

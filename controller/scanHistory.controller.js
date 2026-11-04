@@ -1479,20 +1479,34 @@ const handleGroupScan = async (conn, res, ctx) => {
         }
 
         // --------------------------------------------------------
-        // Rejected item check
+        // Block REJECTED, REWORK and PENDING_QA group members
         // --------------------------------------------------------
 
-        const rejectedItem = sequenceRows.find((item) => item.status === "REJECTED");
+        const blockedItem = sequenceRows.find((item) =>
+          ["REJECTED", "REWORK", "PENDING_QA"].includes(item.status)
+        );
 
-        if (rejectedItem) {
+        if (blockedItem) {
           await conn.rollback();
+
+          const statusMessages = {
+            REJECTED: "has been rejected and cannot continue production.",
+            REWORK: "is currently under rework and cannot continue production.",
+            PENDING_QA: "is awaiting QA approval and cannot continue production.",
+          };
+
+          const errorTypes = {
+            REJECTED: "SERIAL_REJECTED",
+            REWORK: "SERIAL_IN_REWORK",
+            PENDING_QA: "SERIAL_PENDING_QA",
+          };
 
           return res.status(409).json({
             success: false,
-            errorType: "SERIAL_REJECTED",
-            message: `Item ${rejectedItem.serial_no} has been rejected and cannot continue production.`,
+            errorType: errorTypes[blockedItem.status],
+            message: `Item ${blockedItem.serial_no} ${statusMessages[blockedItem.status]}`,
             productionOrderId: productionOrder.id,
-            scannedSerial: rejectedItem.serial_no,
+            scannedSerial: blockedItem.serial_no,
           });
         }
 
