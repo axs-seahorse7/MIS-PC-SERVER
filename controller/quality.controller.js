@@ -1,6 +1,8 @@
 
 import { pool } from "../DB/config/mysql.config.js";
 
+const isAdmin = (user) => ["SYSTEM_ADMIN", "ADMIN"].includes(user?.role);
+
 const getUserContext = async (conn, userId) => {
   const [rows] = await conn.query(
     `SELECT id, factory_id, line_id, stage_id
@@ -69,25 +71,56 @@ const getProductionItem = async (conn, serialNo, factoryId, lineId) => {
 // ----------------------------------------------------
 export const getReworkStations = async (req, res) => {
   try {
-    const conn = await pool.getConnection();
+    const user = await getUserContext(pool, req.user.id);
 
-    try {
-      const user = await getUserContext(conn, req.user.id);
+    const admin = isAdmin(req.user);
+    const { factory_id, line_id, active_only } = req.query;
 
-      const [rows] = await conn.query(
-        `SELECT id, factory_id, line_id, name, code, description,
-                is_active, created_at
-         FROM rework_stations
-         WHERE factory_id = ?
-           AND (? IS NULL OR line_id = ?)
-         ORDER BY name`,
-        [user.factory_id, user.line_id, user.line_id]
-      );
+    let sql = `
+      SELECT
+        rs.id,
+        rs.factory_id,
+        f.name AS factory_name,
+        rs.line_id,
+        pl.name AS line_name,
+        rs.name,
+        rs.code,
+        rs.description,
+        rs.is_active,
+        rs.created_at,
+        rs.updated_at
+      FROM rework_stations rs
+      INNER JOIN factories f ON f.id = rs.factory_id
+      INNER JOIN production_lines pl ON pl.id = rs.line_id
+      WHERE 1 = 1
+    `;
 
-      return res.json({ success: true, data: rows });
-    } finally {
-      conn.release();
+    const params = [];
+
+    if (!admin) {
+      sql += ` AND rs.factory_id = ? AND rs.line_id = ? AND rs.is_active = 1`;
+      params.push(user.factory_id, user.line_id);
+    } else {
+      if (factory_id) {
+        sql += ` AND rs.factory_id = ?`;
+        params.push(factory_id);
+      }
+
+      if (line_id) {
+        sql += ` AND rs.line_id = ?`;
+        params.push(line_id);
+      }
+
+      if (active_only === "true") {
+        sql += ` AND rs.is_active = 1`;
+      }
     }
+
+    sql += ` ORDER BY f.name, pl.name, rs.name`;
+
+    const [rows] = await pool.query(sql, params);
+
+    return res.json({ success: true, data: rows });
   } catch (error) {
     return res.status(error.status || 500).json({
       success: false,
@@ -100,51 +133,47 @@ export const getReworkStations = async (req, res) => {
 // POST /api/quality/stations
 // ----------------------------------------------------
 export const createReworkStation = async (req, res) => {
-  const conn = await pool.getConnection();
-
   try {
-    const user = await getUserContext(conn, req.user.id);
-    const { line_id, name, code, description } = req.body;
-
-    if (!user.factory_id) {
-      return res.status(400).json({
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({
         success: false,
-        message: "Your user is not assigned to a factory.",
+        message: "Only Admin can create rework stations.",
       });
     }
 
-    if (!line_id || !name?.trim() || !code?.trim()) {
+    const { factory_id, line_id, name, code, description } = req.body;
+
+    if (!factory_id || !line_id || !name?.trim() || !code?.trim()) {
       return res.status(400).json({
         success: false,
-        message: "line_id, name and code are required.",
+        message: "Factory, Line, Name and Code are required.",
       });
     }
 
-    // A line must belong to the authenticated user's factory.
-    const [lineRows] = await conn.query(
+    const [lines] = await pool.query(
       `SELECT id FROM production_lines
        WHERE id = ? AND factory_id = ? AND is_active = 1`,
-      [line_id, user.factory_id]
+      [line_id, factory_id]
     );
 
-    if (!lineRows.length) {
+    if (!lines.length) {
       return res.status(400).json({
         success: false,
-        message: "Selected line does not belong to your factory or is inactive.",
+        message: "Selected production line is invalid or inactive.",
       });
     }
 
-    const [result] = await conn.query(
+    const [result] = await pool.query(
       `INSERT INTO rework_stations
        (factory_id, line_id, name, code, description, created_by)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
-        user.factory_id,
+        factory_id,
         line_id,
         name.trim(),
         code.trim().toUpperCase(),
         description?.trim() || null,
-        user.id,
+        req.user.id,
       ]
     );
 
@@ -156,14 +185,126 @@ export const createReworkStation = async (req, res) => {
   } catch (error) {
     const duplicate = error.code === "ER_DUP_ENTRY";
 
-    return res.status(duplicate ? 409 : error.status || 500).json({
+    return res.status(duplicate ? 409 : 500).json({
       success: false,
       message: duplicate
-        ? "A station with this name or code already exists on this line."
+        ? "Station name or code already exists on this line."
         : error.message,
     });
-  } finally {
-    conn.release();
+  }
+};
+
+export const updateReworkStation = async (req, res) => {
+  try {
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only Admin can update rework stations.",
+      });
+    }
+
+    const { id } = req.params;
+    const { factory_id, line_id, name, code, description } = req.body;
+
+    if (!factory_id || !line_id || !name?.trim() || !code?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Factory, Line, Name and Code are required.",
+      });
+    }
+
+    const [lines] = await pool.query(
+      `SELECT id FROM production_lines
+       WHERE id = ? AND factory_id = ?`,
+      [line_id, factory_id]
+    );
+
+    if (!lines.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Selected line does not belong to this factory.",
+      });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE rework_stations
+       SET factory_id = ?,
+           line_id = ?,
+           name = ?,
+           code = ?,
+           description = ?
+       WHERE id = ?`,
+      [
+        factory_id,
+        line_id,
+        name.trim(),
+        code.trim().toUpperCase(),
+        description?.trim() || null,
+        id,
+      ]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({
+        success: false,
+        message: "Rework station not found.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Rework station updated successfully.",
+    });
+  } catch (error) {
+    return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({
+      success: false,
+      message: error.code === "ER_DUP_ENTRY"
+        ? "Station name or code already exists on this line."
+        : error.message,
+    });
+  }
+};
+
+export const updateReworkStationStatus = async (req, res) => {
+  try {
+    if (!isAdmin(req.user)) {
+      return res.status(403).json({
+        success: false,
+        message: "Only Admin can change station status.",
+      });
+    }
+
+    const { id } = req.params;
+    const { is_active } = req.body;
+
+    if (![0, 1, true, false].includes(is_active)) {
+      return res.status(400).json({
+        success: false,
+        message: "is_active must be 0 or 1.",
+      });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE rework_stations SET is_active = ? WHERE id = ?`,
+      [is_active ? 1 : 0, id]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({
+        success: false,
+        message: "Rework station not found.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Station status updated successfully.",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
 };
 
