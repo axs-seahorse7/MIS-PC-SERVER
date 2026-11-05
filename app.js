@@ -11,6 +11,8 @@ import { globalErrorHandler } from "./utils/AppError.js";
 import {verifyToken} from "./middleWare/auth.middleware.js";
 
 
+import dashboardRoutes from "./routes/dashboard.routes.js";
+
 // Route imports
 import userRoutes from "./routes/user.routes.js";
 import authRoutes from "./routes/auth.routes.js";
@@ -107,7 +109,11 @@ app.use("/api/print",                 printRoutes);
 
 app.use(verifyToken); // Apply JWT verification middleware to all routes below
 
+
 // ---------- Routes ----------
+app.use("/api/dashboard", dashboardRoutes);
+
+
 app.use("/api/categories",              categoryRoutes);
 
 app.use("/api/stages",                  stageRoutes);

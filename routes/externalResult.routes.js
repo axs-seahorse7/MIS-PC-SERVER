@@ -6,6 +6,8 @@ import {
   getExternalResultByIdentifier,
 } from "../controller/externalResult.controller.js";
 
+
+
 const router = express.Router();
 
 router.post("/create", receiveExternalResult);
